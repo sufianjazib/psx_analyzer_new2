@@ -88,12 +88,23 @@ REQUIRED_MIN = ["ticker", "price", "market_cap", "eps"]
 
 
 def clean_col(c):
-    c = str(c).strip().lower()
-    c = c.replace("%", "percent")
-    c = c.replace("/", "_")
-    c = c.replace("-", "_")
-    c = c.replace(" ", "_")
-    return ALIASES.get(c, c)
+    # Robust header normalization for PSX exports, including BOM and punctuation.
+    c = str(c).replace("\ufeff", "").strip().lower()
+    c = c.replace("%", "percent").replace("/", "_").replace("-", "_")
+    c = c.replace(".", "_").replace("(", "_").replace(")", "_")
+    c = "_".join(c.split())
+    c = "_".join(part for part in c.split("_") if part)
+    extra = {
+        "trading_symbol": "ticker", "scrip": "ticker", "scrip_code": "ticker",
+        "security": "ticker", "security_name": "company", "ldcp": "price",
+        "current_price": "price", "share_price": "price",
+        "market_capitalization": "market_cap", "market_capitalisation": "market_cap",
+        "market_cap_mn": "market_cap", "market_cap_m": "market_cap",
+        "price_earnings_ratio": "pe", "p_e": "pe",
+        "dividend_yield_percent": "dividend_yield",
+        "sponsor": "promoter_holding", "sponsor_shareholding": "promoter_holding",
+    }
+    return extra.get(c, ALIASES.get(c, c))
 
 
 def clean_numeric(series):
@@ -112,39 +123,30 @@ def clean_numeric(series):
 
 
 def normalize_df(df):
-    df = df.copy()
-    df.columns = [clean_col(c) for c in df.columns]
-
-    # Remove duplicate columns after normalization.
-    df = df.loc[:, ~df.columns.duplicated()]
-
-    numeric_candidates = [
-        "price", "market_cap", "revenue", "revenue_prev", "eps", "eps_prev",
-        "eps_3y_ago", "eps_5y_ago", "net_profit", "net_profit_prev", "roe",
-        "roic", "operating_cash_flow", "free_cash_flow", "debt", "cash",
-        "ebitda", "shares", "dividend_yield", "pe", "pb", "ev_ebitda",
-        "promoter_holding", "free_float", "avg_volume", "capacity_growth",
-        "utilization", "catalyst_score", "governance_score"
-    ]
-    for c in numeric_candidates:
-        if c in df.columns:
-            df[c] = clean_numeric(df[c])
-
+    df=df.copy().dropna(axis=0,how="all").dropna(axis=1,how="all")
+    df.columns=[clean_col(c) for c in df.columns]
+    df=df.loc[:,~df.columns.duplicated()]
     if "ticker" not in df.columns:
-        raise ValueError("CSV must contain a ticker/symbol/code column.")
-
-    for c in REQUIRED_MIN:
-        if c not in df.columns:
-            raise ValueError(f"CSV is missing required column: {c}")
-
-    # Infer PE when possible.
+        raise ValueError(
+            "Could not find the stock symbol column.\n\n"
+            f"Detected columns: {', '.join(map(str, df.columns))}\n\n"
+            "Rename the PSX symbol column to 'ticker' if needed. Accepted names "
+            "include Symbol, Code, Trading Symbol, Scrip and Scrip Code."
+        )
+    numeric_candidates=["price","market_cap","revenue","revenue_prev","eps","eps_prev",
+        "eps_3y_ago","eps_5y_ago","net_profit","net_profit_prev","roe","roic",
+        "operating_cash_flow","free_cash_flow","debt","cash","ebitda","shares",
+        "dividend_yield","pe","pb","ev_ebitda","promoter_holding","free_float",
+        "avg_volume","capacity_growth","utilization","catalyst_score","governance_score"]
+    for c in numeric_candidates:
+        if c in df.columns: df[c]=clean_numeric(df[c])
+    if "market_cap" not in df.columns and "shares" in df.columns and "price" in df.columns:
+        df["market_cap"]=df["price"]*df["shares"]
     if "pe" not in df.columns:
-        df["pe"] = np.where(df["eps"] > 0, df["price"] / df["eps"], np.nan)
-
-    # Infer market cap if shares are supplied.
-    if "market_cap" not in df.columns and "shares" in df.columns:
-        df["market_cap"] = df["price"] * df["shares"]
-
+        df["pe"]=np.where(df["eps"]>0,df["price"]/df["eps"],np.nan)
+    missing=[c for c in ["price","market_cap","eps"] if c not in df.columns]
+    if missing:
+        raise ValueError("Recognized the symbol column, but required data fields are missing: " + ", ".join(missing) + "\n\nDetected columns: " + ", ".join(map(str,df.columns)))
     return df
 
 
@@ -559,7 +561,8 @@ with tab1:
     if uploaded is not None:
         try:
             if uploaded.name.lower().endswith(".csv"):
-                df = pd.read_csv(uploaded)
+                uploaded.seek(0)
+                df = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8-sig")
             else:
                 df = pd.read_excel(uploaded)
             st.success(f"Loaded {len(df):,} rows from {uploaded.name}")
