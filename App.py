@@ -443,3 +443,86 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+@st.cache_data(ttl=900)  # Cache results for 15 minutes
+def fetch_psx_web_data(symbol: str) -> dict:
+    """
+    Directly scrapes live stock quote and statistical data from PSX Data Portal.
+    Uses flexible regex matching across all HTML tables to catch varied layouts.
+    """
+    symbol = symbol.strip().upper()
+    url = f"https://dps.psx.com.pk/company/{symbol}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return {"error": f"Symbol '{symbol}' not found or PSX Portal unavailable."}
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # 1. Parse Current Price
+        price = None
+        price_elem = soup.find("div", class_="quote__close") or soup.find("div", class_="price")
+        if price_elem:
+            price_match = re.search(r"[\d,]+\.?\d*", price_elem.text)
+            if price_match:
+                price = float(price_match.group(0).replace(",", ""))
+
+        # 2. Extract Data from Stats Tables or Key Data Sections
+        scraped_data = {}
+        
+        # Look through all table rows and stat divs
+        elements = soup.find_all(["tr", "div"], class_=re.compile(r"stats|item|row|detail", re.I))
+        for elem in elements:
+            text = elem.get_text(separator=" ", strip=True).lower()
+            
+            # Extract Market Cap
+            if "market cap" in text and "market_cap" not in scraped_data:
+                match = re.search(r"(\d[\d,]*\b)", text)
+                if match:
+                    scraped_data["market_cap"] = float(match.group(1).replace(",", ""))
+
+            # Extract EPS
+            if ("eps" in text or "earnings per share" in text) and "eps" not in scraped_data:
+                match = re.search(r"(-?\d+\.?\d*)", text.split("eps")[-1])
+                if match:
+                    scraped_data["eps"] = float(match.group(1))
+
+            # Extract P/E
+            if ("p/e" in text or "pe ratio" in text) and "pe" not in scraped_data:
+                match = re.search(r"(\d+\.?\d*)", text.split("e")[-1])
+                if match:
+                    scraped_data["pe"] = float(match.group(1))
+
+            # Extract Dividend Yield
+            if ("div yield" in text or "dividend yield" in text) and "dividend_yield" not in scraped_data:
+                match = re.search(r"(\d+\.?\d*)", text)
+                if match:
+                    scraped_data["dividend_yield"] = float(match.group(1))
+
+        # Fallback values if specific items were missing from table loops
+        mcap = scraped_data.get("market_cap")
+        eps = scraped_data.get("eps")
+        pe = scraped_data.get("pe")
+        dy = scraped_data.get("dividend_yield", 0.0)
+
+        # Impute P/E if EPS and Price exist but P/E wasn't explicitly read
+        if pe is None and price and eps and eps > 0:
+            pe = round(price / eps, 2)
+
+        return {
+            "ticker": symbol,
+            "price": price,
+            "market_cap": mcap,
+            "eps": eps,
+            "pe": pe,
+            "dividend_yield": dy,
+            "source": "PSX Data Portal"
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to scrape PSX portal: {str(e)}"}
