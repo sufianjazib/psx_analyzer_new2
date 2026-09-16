@@ -65,12 +65,13 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(ttl=900)  # Cache results for 15 minutes
 def fetch_psx_web_data(symbol: str) -> dict:
     """
-    Directly scrapes live stock quote data from the PSX Data Portal (dps.psx.com.pk).
+    Directly scrapes live stock quote and statistical data from PSX Data Portal.
+    Uses regex matching to reliably extract stats from dynamic HTML layouts.
     """
     symbol = symbol.strip().upper()
     url = f"https://dps.psx.com.pk/company/{symbol}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     try:
@@ -80,32 +81,48 @@ def fetch_psx_web_data(symbol: str) -> dict:
 
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Parse Price
-        price_elem = soup.find("div", class_="quote__close")
-        price = float(price_elem.text.replace("Rs.", "").replace(",", "").strip()) if price_elem else None
+        # Extract Price
+        price = None
+        price_elem = soup.find("div", class_="quote__close") or soup.find("div", class_="price")
+        if price_elem:
+            price_match = re.search(r"[\d,]+\.?\d*", price_elem.text)
+            if price_match:
+                price = float(price_match.group(0).replace(",", ""))
 
-        # Parse Stats Table / Key Indicators
-        stats = {}
-        for item in soup.find_all("div", class_="stats_item"):
-            label_elem = item.find("div", class_="stats_label")
-            value_elem = item.find("div", class_="stats_value")
-            if label_elem and value_elem:
-                lbl = label_elem.text.strip().lower()
-                val = value_elem.text.strip().replace(",", "")
-                stats[lbl] = val
+        # Scrape Stats Box / Key Indicators
+        scraped_data = {}
+        for item in soup.find_all("div", class_=re.compile(r"stats_item|quote__item|item", re.I)):
+            label = item.find(class_=re.compile(r"label|title", re.I))
+            value = item.find(class_=re.compile(r"value|val", re.I))
+            if label and value:
+                lbl_text = label.get_text().strip().lower()
+                val_text = value.get_text().strip().replace(",", "")
+                scraped_data[lbl_text] = val_text
 
-        # Extract specific metrics with fallbacks
-        def safe_float(val_str):
-            try:
-                clean = re.sub(r'[^\d.-]', '', str(val_str))
-                return float(clean) if clean else None
-            except:
-                return None
+        # Extract stats using regex
+        def parse_number(val):
+            if not val: return None
+            m = re.search(r"(-?\d+\.?\d*)", str(val))
+            return float(m.group(1)) if m else None
 
-        mcap = safe_float(stats.get("market cap", stats.get("mcap")))
-        eps = safe_float(stats.get("eps", stats.get("eps (ttm)")))
-        pe = safe_float(stats.get("p/e", stats.get("pe ratio")))
-        div_yield = safe_float(stats.get("dividend yield", stats.get("div yield")))
+        mcap = None
+        eps = None
+        pe = None
+        dy = 0.0
+
+        for k, v in scraped_data.items():
+            if "market cap" in k or "mcap" in k:
+                mcap = parse_number(v)
+            elif "eps" in k:
+                eps = parse_number(v)
+            elif "p/e" in k or "pe" in k:
+                pe = parse_number(v)
+            elif "yield" in k or "div" in k:
+                dy = parse_number(v) or 0.0
+
+        # Calculate P/E fallback if EPS and Price exist
+        if pe is None and price and eps and eps > 0:
+            pe = round(price / eps, 2)
 
         return {
             "ticker": symbol,
@@ -113,12 +130,12 @@ def fetch_psx_web_data(symbol: str) -> dict:
             "market_cap": mcap,
             "eps": eps,
             "pe": pe,
-            "dividend_yield": div_yield,
-            "source": "Direct PSX Portal Scraping"
+            "dividend_yield": dy,
+            "source": "PSX Data Portal"
         }
+
     except Exception as e:
         return {"error": f"Failed to scrape PSX portal: {str(e)}"}
-
 # -----------------------------------------------------------------------------
 # 3. MULTIBAGGER EVALUATION ENGINE (100-POINT FRAMEWORK)
 # -----------------------------------------------------------------------------
