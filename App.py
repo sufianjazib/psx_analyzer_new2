@@ -124,136 +124,141 @@ def fetch_psx_web_data(symbol: str) -> dict:
 # -----------------------------------------------------------------------------
 
 def evaluate_multibagger(row: pd.Series) -> dict:
-    """Calculates Business Quality, Multibagger Potential, and Risk/Valuation scores safely."""
+    """Calculates scores dynamically based on whether full or basic scraped data is available."""
     
-    # Helper function to convert any missing, NaN, or non-numeric value safely to float
-    def safe_val(key, default=0.0):
-        val = row.get(key, default)
-        if pd.isna(val) or val is None:
+    def safe_val(key, default=None):
+        val = row.get(key, None)
+        if pd.isna(val) or val is None or val == "":
             return default
         try:
             return float(val)
         except (ValueError, TypeError):
             return default
 
-    # Extract clean numeric values
-    revenue = safe_val("revenue")
-    revenue_prev = safe_val("revenue_prev")
-    eps = safe_val("eps")
-    eps_prev = safe_val("eps_prev")
-    eps_3y = safe_val("eps_3y_ago")
-    roe = safe_val("roe")
-    roic = safe_val("roic")
-    ocf = safe_val("operating_cash_flow")
-    pat = safe_val("net_profit")
-    ebitda = safe_val("ebitda")
-    mcap = safe_val("market_cap")
-    cap_growth = safe_val("capacity_growth")
-    utilization = safe_val("utilization")
+    # Core Metrics
+    mcap = safe_val("market_cap", 0.0)
+    pe = safe_val("pe", 0.0)
+    dy = safe_val("dividend_yield", 0.0)
+    eps = safe_val("eps", 0.0)
+    eps_prev = safe_val("eps_prev", None)
+    
+    # Extended Financial Metrics
+    revenue = safe_val("revenue", None)
+    revenue_prev = safe_val("revenue_prev", None)
+    roe = safe_val("roe", None)
+    roic = safe_val("roic", None)
+    ocf = safe_val("operating_cash_flow", None)
+    pat = safe_val("net_profit", None)
+    ebitda = safe_val("ebitda", None)
+    debt = safe_val("debt", None)
+    cash = safe_val("cash", None)
+    cap_growth = safe_val("capacity_growth", None)
+    utilization = safe_val("utilization", None)
     catalyst = safe_val("catalyst_score", 4.0)
-    pe = safe_val("pe")
-    debt = safe_val("debt")
-    cash = safe_val("cash")
-    dy = safe_val("dividend_yield")
     gov = safe_val("governance_score", 8.0)
 
-    # --- Category 1: Business Quality (30 Points) ---
+    # Detect if extended fundamental data is provided
+    has_extended_data = any(v is not None for v in [revenue, roe, roic, ocf, debt])
+
+    # ---------------------------------------------------------
+    # 1. Business Quality (30 Points)
+    # ---------------------------------------------------------
     bq_score = 0.0
+    if has_extended_data:
+        if revenue and revenue_prev and revenue_prev > 0:
+            rev_growth = ((revenue - revenue_prev) / revenue_prev) * 100
+            if rev_growth >= 15: bq_score += 5.0
+            elif rev_growth >= 10: bq_score += 3.0
+        else: bq_score += 2.5
 
-    # Revenue Growth (>15% = 5 pts, >10% = 3 pts)
-    if revenue > 0 and revenue_prev > 0:
-        rev_growth = ((revenue - revenue_prev) / revenue_prev) * 100
-        if rev_growth >= 15: bq_score += 5.0
-        elif rev_growth >= 10: bq_score += 3.0
+        if eps > 0 and eps_prev and eps_prev > 0:
+            eps_growth = ((eps - eps_prev) / eps_prev) * 100
+            if eps_growth >= 15: bq_score += 5.0
+            elif eps_growth >= 8: bq_score += 3.0
+        else: bq_score += 2.5
+
+        if roe:
+            if roe >= 20: bq_score += 5.0
+            elif roe >= 15: bq_score += 3.0
+        else: bq_score += 2.5
+
+        if roic:
+            if roic >= 18: bq_score += 5.0
+            elif roic >= 12: bq_score += 3.0
+        else: bq_score += 2.5
+
+        if pat and ocf and pat > 0:
+            if (ocf / pat) >= 1.0: bq_score += 5.0
+            elif (ocf / pat) >= 0.7: bq_score += 3.0
+        else: bq_score += 2.5
+
+        if revenue and ebitda and revenue > 0:
+            ebitda_margin = (ebitda / revenue) * 100
+            if ebitda_margin >= 20: bq_score += 5.0
+            elif ebitda_margin >= 12: bq_score += 3.0
+        else: bq_score += 2.5
     else:
-        bq_score += 2.5
+        # Quick Estimate for Scraped Data: infer business quality from earnings valuation profile
+        if eps > 0 and pe > 0:
+            if pe < 10: bq_score = 22.0
+            elif pe < 18: bq_score = 18.0
+            else: bq_score = 12.0
+        else:
+            bq_score = 15.0
 
-    # EPS Growth (>15% = 5 pts)
-    if eps > 0 and eps_prev > 0:
-        eps_growth = ((eps - eps_prev) / eps_prev) * 100
-        if eps_growth >= 15: bq_score += 5.0
-        elif eps_growth >= 8: bq_score += 3.0
-    else:
-        bq_score += 2.5
-
-    # ROE (>20% = 5 pts, >15% = 3 pts)
-    if roe >= 20: bq_score += 5.0
-    elif roe >= 15: bq_score += 3.0
-
-    # ROIC (>18% = 5 pts)
-    if roic >= 18: bq_score += 5.0
-    elif roic >= 12: bq_score += 3.0
-
-    # OCF vs Net Profit Quality (>1.0 = 5 pts)
-    if pat > 0 and ocf > 0:
-        if (ocf / pat) >= 1.0: bq_score += 5.0
-        elif (ocf / pat) >= 0.7: bq_score += 3.0
-    else:
-        bq_score += 2.5
-
-    # EBITDA Margin (>20% = 5 pts)
-    if revenue > 0 and ebitda > 0:
-        ebitda_margin = (ebitda / revenue) * 100
-        if ebitda_margin >= 20: bq_score += 5.0
-        elif ebitda_margin >= 12: bq_score += 3.0
-    else:
-        bq_score += 2.5
-
-
-    # --- Category 2: Multibagger Potential (35 Points) ---
+    # ---------------------------------------------------------
+    # 2. Multibagger Potential (35 Points)
+    # ---------------------------------------------------------
     mp_score = 0.0
-
+    
     # Market Cap Scalability
-    if 0 < mcap <= 25_000_000_000:
-        mp_score += 7.0
-    elif 25_000_000_000 < mcap <= 75_000_000_000:
-        mp_score += 4.5
-    else:
-        mp_score += 2.0
+    if 0 < mcap <= 25_000_000_000: mp_score += 10.0
+    elif 25_000_000_000 < mcap <= 75_000_000_000: mp_score += 7.0
+    elif mcap > 75_000_000_000: mp_score += 4.0
+    else: mp_score += 5.0
 
-    # EPS CAGR
-    if eps > 0 and eps_3y > 0:
-        eps_cagr = ((eps / eps_3y) ** (1/3) - 1) * 100
-        if eps_cagr >= 20: mp_score += 7.0
-        elif eps_cagr >= 12: mp_score += 4.0
-    else:
-        mp_score += 3.5
+    # Capacity / Catalyst / Growth Metrics
+    if cap_growth:
+        if cap_growth >= 15: mp_score += 9.0
+        elif cap_growth >= 5: mp_score += 5.0
+        else: mp_score += 2.0
+    else: mp_score += 6.0
 
-    # Capacity Expansion & Utilization
-    if cap_growth >= 15: mp_score += 7.0
-    elif cap_growth >= 5: mp_score += 4.0
-    else: mp_score += 2.0
+    if utilization:
+        if utilization >= 75: mp_score += 9.0
+        elif utilization >= 50: mp_score += 5.0
+        else: mp_score += 2.0
+    else: mp_score += 6.0
 
-    if utilization >= 75: mp_score += 7.0
-    elif utilization >= 50: mp_score += 4.0
-    else: mp_score += 2.0
-
-    # Catalyst Score
     mp_score += min(max(catalyst, 0.0), 7.0)
 
-
-    # --- Category 3: Risk & Valuation (35 Points) ---
+    # ---------------------------------------------------------
+    # 3. Risk & Valuation (35 Points)
+    # ---------------------------------------------------------
     rv_score = 0.0
 
-    # P/E Ratio
-    if 0 < pe <= 8: rv_score += 8.0
-    elif 8 < pe <= 14: rv_score += 5.0
-    else: rv_score += 2.0
-
-    # Debt / Cash Health
-    if debt == 0 or (cash > debt): rv_score += 8.0
-    elif ebitda > 0 and (debt / ebitda) < 2.0: rv_score += 5.0
-    else: rv_score += 2.0
-
-    # Dividend Yield
-    if dy >= 8.0: rv_score += 7.0
-    elif dy >= 4.0: rv_score += 4.0
+    # P/E Evaluation
+    if 0 < pe <= 6: rv_score += 10.0
+    elif 6 < pe <= 12: rv_score += 7.0
+    elif 12 < pe <= 20: rv_score += 4.0
     else: rv_score += 1.0
 
-    # Governance Score
-    rv_score += min(max(gov, 0.0), 12.0)
+    # Dividend Yield Evaluation
+    if dy >= 10.0: rv_score += 8.0
+    elif dy >= 5.0: rv_score += 5.0
+    elif dy > 0: rv_score += 3.0
+    else: rv_score += 1.0
 
-    # --- Classification & Scores ---
+    # Debt Health
+    if debt is not None and cash is not None:
+        if debt == 0 or cash > debt: rv_score += 7.0
+        else: rv_score += 3.0
+    else:
+        rv_score += 5.0  # Neutral balance
+
+    rv_score += min(max(gov, 0.0), 10.0)
+
+    # Final Aggregation
     total_score = round(bq_score + mp_score + rv_score, 2)
     
     if total_score >= 85: status = "Multibagger Candidate"
