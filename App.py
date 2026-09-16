@@ -65,52 +65,67 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(ttl=900)  # Cache results for 15 minutes
 def fetch_psx_web_data(symbol: str) -> dict:
     """
-    Fetches stock data directly from the official PSX Data Portal JSON endpoints.
+    Directly scrapes live stock quote and stat data from the PSX Portal (dps.psx.com.pk).
+    Uses robust string/regex searching over HTML to avoid API 404/JSON errors.
     """
     symbol = symbol.strip().upper()
-    
-    # PSX Internal API Endpoints
-    quote_url = f"https://dps.psx.com.pk/api/quote/{symbol}"
-    summary_url = f"https://dps.psx.com.pk/api/company/{symbol}"
-    
+    url = f"https://dps.psx.com.pk/company/{symbol}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
     }
 
     try:
-        # Fetch Live Quote
-        res_quote = requests.get(quote_url, headers=headers, timeout=10)
-        if res_quote.status_code != 200:
-            return {"error": f"Symbol '{symbol}' not found on PSX."}
-            
-        quote_data = res_quote.json()
+        response = requests.get(url, headers=headers, timeout=12)
+        if response.status_code != 200:
+            return {"error": f"Symbol '{symbol}' not found or PSX Portal unavailable (Status Code: {response.status_code})."}
 
-        # Parse primary values safely
-        price = float(quote_data.get("current", quote_data.get("close", 0.0)))
-        
-        # Fetch Financial Summary Statistics
-        res_summary = requests.get(summary_url, headers=headers, timeout=10)
-        stats = {}
-        if res_summary.status_code == 200:
-            stats = res_summary.json()
+        soup = BeautifulSoup(response.text, "html.parser")
+        html_text = response.text
 
-        def safe_float(val):
-            try:
-                if val is None: return None
-                clean = re.sub(r'[^\d.-]', '', str(val))
-                return float(clean) if clean else None
-            except:
-                return None
+        # 1. Parse Stock Price
+        price = None
+        price_elem = soup.find("div", class_="quote__close") or soup.find("div", class_="stats_value")
+        if price_elem:
+            p_match = re.search(r"[\d,]+\.?\d*", price_elem.text)
+            if p_match:
+                price = float(p_match.group(0).replace(",", ""))
 
-        # Extract stats from PSX API response
-        mcap = safe_float(stats.get("mcap") or stats.get("marketCap") or quote_data.get("mcap"))
-        eps = safe_float(stats.get("eps") or quote_data.get("eps"))
-        pe = safe_float(stats.get("pe") or quote_data.get("pe"))
-        dy = safe_float(stats.get("divYield") or stats.get("yield") or 0.0)
+        # 2. Extract Key Indicators using regex pattern matching over raw HTML & text
+        def extract_metric(patterns, text_source):
+            for pat in patterns:
+                match = re.search(pat, text_source, re.IGNORECASE)
+                if match:
+                    val_str = match.group(1).replace(",", "").strip()
+                    try:
+                        return float(val_str)
+                    except ValueError:
+                        continue
+            return None
 
-        # Auto-compute P/E if missing
-        if pe is None and price > 0 and eps and eps > 0:
+        # Scraping patterns based on PSX Portal markup
+        mcap = extract_metric([
+            r'Market\s*Cap(?:italisation)?\s*<\/div>\s*<div[^>]*>\s*Rs\.?\s*([\d,]+)',
+            r'Market\s*Cap[^\d]*([\d,]+)'
+        ], html_text)
+
+        eps = extract_metric([
+            r'EPS\s*\(TTM\)\s*<\/div>\s*<div[^>]*>\s*Rs\.?\s*(-?[\d\.]+)',
+            r'EPS[^\d]*(-?[\d\.]+)'
+        ], html_text)
+
+        pe = extract_metric([
+            r'P\/E\s* Ratio\s*<\/div>\s*<div[^>]*>\s*([\d\.]+)',
+            r'P\/E[^\d]*([\d\.]+)'
+        ], html_text)
+
+        dy = extract_metric([
+            r'Div(?:idend)?\s*Yield\s*<\/div>\s*<div[^>]*>\s*([\d\.]+)%',
+            r'Yield[^\d]*([\d\.]+)'
+        ], html_text) or 0.0
+
+        # Auto-compute P/E if missing but Price & EPS are found
+        if pe is None and price and eps and eps > 0:
             pe = round(price / eps, 2)
 
         return {
@@ -120,30 +135,11 @@ def fetch_psx_web_data(symbol: str) -> dict:
             "eps": eps,
             "pe": pe,
             "dividend_yield": dy,
-            "source": "PSX Direct API"
+            "source": "PSX Data Portal"
         }
 
     except Exception as e:
-        # Fallback to web scraping if API fails
-        try:
-            url = f"https://dps.psx.com.pk/company/{symbol}"
-            res = requests.get(url, headers=headers, timeout=10)
-            soup = BeautifulSoup(res.text, "html.parser")
-            
-            price_elem = soup.find("div", class_="quote__close")
-            price = float(re.sub(r'[^\d.]', '', price_elem.text)) if price_elem else 0.0
-            
-            return {
-                "ticker": symbol,
-                "price": price,
-                "market_cap": None,
-                "eps": None,
-                "pe": None,
-                "dividend_yield": 0.0,
-                "source": "PSX HTML Fallback"
-            }
-        except Exception as err:
-            return {"error": f"Failed to fetch data for {symbol}: {str(err)}"}
+        return {"error": f"Failed to fetch data for '{symbol}': {str(e)}"}
 # -----------------------------------------------------------------------------
 # 3. MULTIBAGGER EVALUATION ENGINE (100-POINT FRAMEWORK)
 # -----------------------------------------------------------------------------
