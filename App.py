@@ -1,736 +1,433 @@
 import os
-import io
-import math
+import re
 import json
-import textwrap
-from datetime import datetime
-
-import numpy as np
-import pandas as pd
 import requests
+import pandas as pd
+import numpy as np
 import streamlit as st
+from bs4 import BeautifulSoup
+from groq import Groq
 
-try:
-    from groq import Groq
-except Exception:
-    Groq = None
-
-# ============================================================
-# PSX Multibagger Engine
-# Streamlit + Groq
-#
-# Data options:
-# 1) Upload a CSV/XLSX containing PSX fundamentals.
-# 2) Paste a CSV directly into the text box.
-#
-# The app deliberately does NOT promise or predict a guaranteed
-# 10% monthly return. It produces a quantitative score, scenarios,
-# buy-zone framework, and risk/thesis-break monitoring.
-# ============================================================
-
+# Set Streamlit Page Configuration
 st.set_page_config(
     page_title="PSX Multibagger Engine",
     page_icon="📈",
-    layout="wide",
+    layout="wide"
 )
 
-DEFAULT_COLUMNS_HELP = """
-Recommended columns (case-insensitive; aliases are supported):
-ticker, company, price, market_cap, revenue, revenue_prev,
-eps, eps_prev, eps_3y_ago, eps_5y_ago,
-net_profit, net_profit_prev, roe, roic,
-operating_cash_flow, free_cash_flow, debt, cash,
-ebitda, shares, dividend_yield, pe, pb, ev_ebitda,
-promoter_holding, free_float, avg_volume,
-capacity_growth, utilization, catalyst_score, governance_score
-"""
+# -----------------------------------------------------------------------------
+# 1. HELPER FUNCTIONS & COLUMN ALIASING
+# -----------------------------------------------------------------------------
 
-ALIASES = {
-    "symbol": "ticker",
-    "code": "ticker",
-    "stock": "ticker",
-    "name": "company",
-    "company_name": "company",
-    "last_price": "price",
-    "close": "price",
-    "market_capitalisation": "market_cap",
-    "market_capitalization": "market_cap",
-    "sales": "revenue",
-    "sales_current": "revenue",
-    "sales_previous": "revenue_prev",
-    "eps_current": "eps",
-    "eps_current_year": "eps",
-    "eps_previous": "eps_prev",
-    "previous_eps": "eps_prev",
-    "profit": "net_profit",
-    "pat": "net_profit",
-    "profit_after_tax": "net_profit",
-    "previous_profit": "net_profit_prev",
-    "roe_percent": "roe",
-    "roic_percent": "roic",
-    "ocf": "operating_cash_flow",
-    "cfo": "operating_cash_flow",
-    "fcf": "free_cash_flow",
-    "net_debt": "debt",
-    "cash_and_equivalents": "cash",
-    "dividend_yield_percent": "dividend_yield",
-    "pe_ratio": "pe",
-    "price_earnings": "pe",
-    "price_to_book": "pb",
-    "ev_ebitda_ratio": "ev_ebitda",
-    "sponsor_holding": "promoter_holding",
-    "promoter_ownership": "promoter_holding",
-    "free_float_percent": "free_float",
-    "average_volume": "avg_volume",
+COLUMN_ALIASES = {
+    "ticker": ["ticker", "symbol", "code", "scrip"],
+    "company": ["company", "company_name", "name"],
+    "price": ["price", "close", "current_price", "last_price"],
+    "market_cap": ["market_cap", "mcap", "market_capitalization"],
+    "revenue": ["revenue", "sales", "turnover"],
+    "revenue_prev": ["revenue_prev", "sales_prev", "sales_last_year"],
+    "eps": ["eps", "earnings_per_share"],
+    "eps_prev": ["eps_prev", "eps_last_year"],
+    "eps_3y_ago": ["eps_3y_ago", "eps_3y"],
+    "eps_5y_ago": ["eps_5y_ago", "eps_5y"],
+    "net_profit": ["net_profit", "pat", "net_income"],
+    "net_profit_prev": ["net_profit_prev", "pat_prev"],
+    "roe": ["roe", "roe_percent", "return_on_equity"],
+    "roic": ["roic", "roic_percent"],
+    "operating_cash_flow": ["operating_cash_flow", "ocf", "cash_from_operations"],
+    "free_cash_flow": ["free_cash_flow", "fcf"],
+    "debt": ["debt", "total_debt", "liabilities"],
+    "cash": ["cash", "cash_and_equivalents"],
+    "ebitda": ["ebitda"],
+    "dividend_yield": ["dividend_yield", "div_yield", "yield"],
+    "pe": ["pe", "p_e", "pe_ratio"],
+    "capacity_growth": ["capacity_growth", "capacity_expansion"],
+    "utilization": ["utilization", "capacity_utilization"],
+    "catalyst_score": ["catalyst_score", "catalyst"],
+    "governance_score": ["governance_score", "governance"]
 }
 
-REQUIRED_MIN = ["ticker", "price", "market_cap", "eps"]
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardizes column names based on common alias mapping."""
+    df_cols = {str(c).strip().lower(): c for c in df.columns}
+    rename_dict = {}
+    for standard_name, aliases in COLUMN_ALIASES.items():
+        for alias in aliases:
+            if alias in df_cols:
+                rename_dict[df_cols[alias]] = standard_name
+                break
+    return df.rename(columns=rename_dict)
 
+# -----------------------------------------------------------------------------
+# 2. PSX WEB DATA SCRAPER
+# -----------------------------------------------------------------------------
 
-def clean_col(c):
-    # Robust header normalization for PSX exports, including BOM and punctuation.
-    c = str(c).replace("\ufeff", "").strip().lower()
-    c = c.replace("%", "percent").replace("/", "_").replace("-", "_")
-    c = c.replace(".", "_").replace("(", "_").replace(")", "_")
-    c = "_".join(c.split())
-    c = "_".join(part for part in c.split("_") if part)
-    extra = {
-        "trading_symbol": "ticker", "scrip": "ticker", "scrip_code": "ticker",
-        "security": "ticker", "security_name": "company", "ldcp": "price",
-        "current_price": "price", "share_price": "price",
-        "market_capitalization": "market_cap", "market_capitalisation": "market_cap",
-        "market_cap_mn": "market_cap", "market_cap_m": "market_cap",
-        "price_earnings_ratio": "pe", "p_e": "pe",
-        "dividend_yield_percent": "dividend_yield",
-        "sponsor": "promoter_holding", "sponsor_shareholding": "promoter_holding",
+@st.cache_data(ttl=900)  # Cache results for 15 minutes
+def fetch_psx_web_data(symbol: str) -> dict:
+    """
+    Directly scrapes live stock quote data from the PSX Data Portal (dps.psx.com.pk).
+    """
+    symbol = symbol.strip().upper()
+    url = f"https://dps.psx.com.pk/company/{symbol}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
-    return extra.get(c, ALIASES.get(c, c))
 
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return {"error": f"Symbol '{symbol}' not found or PSX Portal unavailable."}
 
-def clean_numeric(series):
-    if pd.api.types.is_numeric_dtype(series):
-        return pd.to_numeric(series, errors="coerce")
-    s = (
-        series.astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("%", "", regex=False)
-        .str.replace("PKR", "", regex=False)
-        .str.replace("Rs.", "", regex=False)
-        .str.replace("Rs", "", regex=False)
-        .str.strip()
-    )
-    return pd.to_numeric(s, errors="coerce")
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # Parse Price
+        price_elem = soup.find("div", class_="quote__close")
+        price = float(price_elem.text.replace("Rs.", "").replace(",", "").strip()) if price_elem else None
 
+        # Parse Stats Table / Key Indicators
+        stats = {}
+        for item in soup.find_all("div", class_="stats_item"):
+            label_elem = item.find("div", class_="stats_label")
+            value_elem = item.find("div", class_="stats_value")
+            if label_elem and value_elem:
+                lbl = label_elem.text.strip().lower()
+                val = value_elem.text.strip().replace(",", "")
+                stats[lbl] = val
 
-def normalize_df(df):
-    df=df.copy().dropna(axis=0,how="all").dropna(axis=1,how="all")
-    df.columns=[clean_col(c) for c in df.columns]
-    df=df.loc[:,~df.columns.duplicated()]
-    if "ticker" not in df.columns:
-        raise ValueError(
-            "Could not find the stock symbol column.\n\n"
-            f"Detected columns: {', '.join(map(str, df.columns))}\n\n"
-            "Rename the PSX symbol column to 'ticker' if needed. Accepted names "
-            "include Symbol, Code, Trading Symbol, Scrip and Scrip Code."
-        )
-    numeric_candidates=["price","market_cap","revenue","revenue_prev","eps","eps_prev",
-        "eps_3y_ago","eps_5y_ago","net_profit","net_profit_prev","roe","roic",
-        "operating_cash_flow","free_cash_flow","debt","cash","ebitda","shares",
-        "dividend_yield","pe","pb","ev_ebitda","promoter_holding","free_float",
-        "avg_volume","capacity_growth","utilization","catalyst_score","governance_score"]
-    for c in numeric_candidates:
-        if c in df.columns: df[c]=clean_numeric(df[c])
-    if "market_cap" not in df.columns and "shares" in df.columns and "price" in df.columns:
-        df["market_cap"]=df["price"]*df["shares"]
-    if "pe" not in df.columns:
-        df["pe"]=np.where(df["eps"]>0,df["price"]/df["eps"],np.nan)
-    missing=[c for c in ["price","market_cap","eps"] if c not in df.columns]
-    if missing:
-        raise ValueError("Recognized the symbol column, but required data fields are missing: " + ", ".join(missing) + "\n\nDetected columns: " + ", ".join(map(str,df.columns)))
-    return df
+        # Extract specific metrics with fallbacks
+        def safe_float(val_str):
+            try:
+                clean = re.sub(r'[^\d.-]', '', str(val_str))
+                return float(clean) if clean else None
+            except:
+                return None
 
+        mcap = safe_float(stats.get("market cap", stats.get("mcap")))
+        eps = safe_float(stats.get("eps", stats.get("eps (ttm)")))
+        pe = safe_float(stats.get("p/e", stats.get("pe ratio")))
+        div_yield = safe_float(stats.get("dividend yield", stats.get("div yield")))
 
-def pct_growth(current, previous):
-    if pd.isna(current) or pd.isna(previous) or previous == 0:
-        return np.nan
-    return (current / previous - 1) * 100
+        return {
+            "ticker": symbol,
+            "price": price,
+            "market_cap": mcap,
+            "eps": eps,
+            "pe": pe,
+            "dividend_yield": div_yield,
+            "source": "Direct PSX Portal Scraping"
+        }
+    except Exception as e:
+        return {"error": f"Failed to scrape PSX portal: {str(e)}"}
 
+# -----------------------------------------------------------------------------
+# 3. MULTIBAGGER EVALUATION ENGINE (100-POINT FRAMEWORK)
+# -----------------------------------------------------------------------------
 
-def cagr(current, old, years):
-    if pd.isna(current) or pd.isna(old) or old <= 0 or current <= 0 or years <= 0:
-        return np.nan
-    return ((current / old) ** (1 / years) - 1) * 100
-
-
-def score_range(value, thresholds):
-    """
-    thresholds = [(minimum_value, points), ...]
-    Highest qualifying threshold wins.
-    """
-    if pd.isna(value):
-        return 0
-    pts = 0
-    for minimum, points in thresholds:
-        if value >= minimum:
-            pts = points
-    return pts
-
-
-def quality_score(r):
-    # 30 points
-    revenue_growth = pct_growth(r.get("revenue", np.nan), r.get("revenue_prev", np.nan))
-    eps_growth = pct_growth(r.get("eps", np.nan), r.get("eps_prev", np.nan))
-    roe = r.get("roe", np.nan)
-    roic = r.get("roic", np.nan)
-
-    s = 0
-    s += score_range(revenue_growth, [(10, 2), (15, 4), (25, 5)])
-    s += score_range(eps_growth, [(10, 3), (20, 5), (30, 7)])
-    s += score_range(roe, [(12, 2), (18, 4), (20, 5)])
-    s += score_range(roic, [(8, 2), (12, 3), (15, 4)])
-
-    # Cash-flow quality: CFO / PAT
-    pat = r.get("net_profit", np.nan)
-    cfo = r.get("operating_cash_flow", np.nan)
-    cfo_pat = np.nan
-    if pd.notna(pat) and pat > 0 and pd.notna(cfo):
-        cfo_pat = cfo / pat
-    s += score_range(cfo_pat, [(0.70, 1), (0.90, 2), (1.10, 3)])
-
-    # Margin improvement: EBITDA / revenue, if available.
-    ebitda = r.get("ebitda", np.nan)
-    rev = r.get("revenue", np.nan)
-    margin = np.nan if pd.isna(ebitda) or pd.isna(rev) or rev == 0 else ebitda / rev
-    s += score_range(margin, [(0.10, 1), (0.15, 2), (0.20, 3)])
-
-    # Governance is kept separate but contributes here only if provided.
-    gov = r.get("governance_score", np.nan)
-    if pd.notna(gov):
-        s += np.clip(gov / 10 * 3, 0, 3)
-
-    return min(float(s), 30.0)
-
-
-def growth_score(r):
-    # 35 points
-    mcap = r.get("market_cap", np.nan)
-    eps = r.get("eps", np.nan)
-    eps_prev = r.get("eps_prev", np.nan)
-    eps3 = r.get("eps_3y_ago", np.nan)
-    eps5 = r.get("eps_5y_ago", np.nan)
-
-    eps_yoy = pct_growth(eps, eps_prev)
-    eps_3y = cagr(eps, eps3, 3)
-    eps_5y = cagr(eps, eps5, 5)
-
-    s = 0
-
-    # Small/mid-cap optional bonus. The thresholds are intentionally
-    # broad so the model doesn't exclude larger companies automatically.
-    if pd.notna(mcap):
-        if mcap <= 10e9:
-            s += 7
-        elif mcap <= 20e9:
-            s += 6
-        elif mcap <= 40e9:
-            s += 5
-        elif mcap <= 100e9:
-            s += 3
-        elif mcap <= 300e9:
-            s += 1
-
-    s += score_range(eps_yoy, [(10, 2), (20, 5), (30, 8)])
-
-    if pd.notna(eps_3y):
-        s += score_range(eps_3y, [(10, 2), (15, 4), (25, 6)])
-    elif pd.notna(eps_5y):
-        s += score_range(eps_5y, [(10, 1), (15, 3), (25, 5)])
-
-    # Capacity growth / utilization.
-    cap = r.get("capacity_growth", np.nan)
-    util = r.get("utilization", np.nan)
-    s += score_range(cap, [(5, 1), (10, 3), (20, 5)])
-    s += score_range(util, [(60, 1), (75, 2)])
-
-    # Catalyst score 0-10 -> up to 4 points.
-    catalyst = r.get("catalyst_score", np.nan)
-    if pd.notna(catalyst):
-        s += np.clip(catalyst / 10 * 4, 0, 4)
-
-    return min(float(s), 35.0)
-
-
-def risk_valuation_score(r):
-    # 35 points
-    price = r.get("price", np.nan)
-    eps = r.get("eps", np.nan)
-    pe = r.get("pe", np.nan)
-    roe = r.get("roe", np.nan)
-    debt = r.get("debt", np.nan)
-    ebitda = r.get("ebitda", np.nan)
-    cash = r.get("cash", np.nan)
-    cfo = r.get("operating_cash_flow", np.nan)
-    pat = r.get("net_profit", np.nan)
-    div_yield = r.get("dividend_yield", np.nan)
-
-    s = 0
-
-    # Valuation 12
-    if pd.notna(pe):
-        if 0 < pe <= 6:
-            s += 12
-        elif pe <= 8:
-            s += 10
-        elif pe <= 10:
-            s += 8
-        elif pe <= 14:
-            s += 5
-        elif pe <= 20:
-            s += 2
+def evaluate_multibagger(row: pd.Series) -> dict:
+    """Calculates Business Quality, Multibagger Potential, and Risk/Valuation scores."""
+    
+    # --- Category 1: Business Quality (30 Points) ---
+    bq_score = 0.0
+    
+    # Revenue Growth (>15% = 5 pts, >10% = 3 pts)
+    rev = row.get("revenue", 0)
+    rev_prev = row.get("revenue_prev", 0)
+    if rev > 0 and rev_prev > 0:
+        rev_growth = ((rev - rev_prev) / rev_prev) * 100
+        if rev_growth >= 15: bq_score += 5.0
+        elif rev_growth >= 10: bq_score += 3.0
     else:
-        # If PE unavailable, don't fabricate a score.
-        s += 0
+        bq_score += 2.5 # Neutral fallback
 
-    # Balance sheet 8: debt / EBITDA proxy
-    if pd.notna(debt) and pd.notna(ebitda) and ebitda > 0:
-        leverage = debt / ebitda
-        if leverage <= 0:
-            s += 8
-        elif leverage <= 1:
-            s += 7
-        elif leverage <= 2:
-            s += 5
-        elif leverage <= 3:
-            s += 3
-        elif leverage <= 4:
-            s += 1
-    elif pd.notna(debt) and pd.notna(cash):
-        net_debt = debt - cash
-        if net_debt <= 0:
-            s += 7
-        elif debt > 0:
-            s += 3
+    # EPS Growth (>15% = 5 pts)
+    eps = row.get("eps", 0)
+    eps_prev = row.get("eps_prev", 0)
+    if eps > 0 and eps_prev > 0:
+        eps_growth = ((eps - eps_prev) / eps_prev) * 100
+        if eps_growth >= 15: bq_score += 5.0
+        elif eps_growth >= 8: bq_score += 3.0
     else:
-        # Unknown is not treated as safe.
-        s += 0
+        bq_score += 2.5
 
-    # Cash-flow quality 6
-    if pd.notna(cfo) and pd.notna(pat) and pat > 0:
-        ratio = cfo / pat
-        if ratio >= 1.1:
-            s += 6
-        elif ratio >= 0.9:
-            s += 4
-        elif ratio >= 0.7:
-            s += 2
+    # ROE (>20% = 5 pts, >15% = 3 pts)
+    roe = row.get("roe", 0)
+    if roe >= 20: bq_score += 5.0
+    elif roe >= 15: bq_score += 3.0
 
-    # Dividend 3 (not required for multibagger status)
-    if pd.notna(div_yield):
-        if div_yield >= 12:
-            s += 3
-        elif div_yield >= 6:
-            s += 2
-        elif div_yield > 0:
-            s += 1
+    # ROIC (>18% = 5 pts)
+    roic = row.get("roic", 0)
+    if roic >= 18: bq_score += 5.0
+    elif roic >= 12: bq_score += 3.0
 
-    # Governance 6
-    gov = r.get("governance_score", np.nan)
-    if pd.notna(gov):
-        s += np.clip(gov / 10 * 6, 0, 6)
+    # OCF vs Net Profit Quality (>1.0 = 5 pts)
+    ocf = row.get("operating_cash_flow", 0)
+    pat = row.get("net_profit", 0)
+    if pat > 0 and ocf > 0:
+        if (ocf / pat) >= 1.0: bq_score += 5.0
+        elif (ocf / pat) >= 0.7: bq_score += 3.0
+    else:
+        bq_score += 2.5
 
-    return min(float(s), 35.0)
-
-
-def calculate_scores(df):
-    out = df.copy()
-    out["quality_score"] = out.apply(quality_score, axis=1)
-    out["growth_score"] = out.apply(growth_score, axis=1)
-    out["risk_value_score"] = out.apply(risk_valuation_score, axis=1)
-    out["multibagger_score"] = (
-        out["quality_score"] + out["growth_score"] + out["risk_value_score"]
-    ).round(1)
-
-    def status(x):
-        if x >= 85:
-            return "MULTIBAGGER CANDIDATE"
-        if x >= 75:
-            return "WATCHLIST"
-        if x >= 65:
-            return "MONITOR"
-        return "NO MULTIBAGGER STATUS"
-
-    out["status"] = out["multibagger_score"].apply(status)
-
-    # Fundamental hard gates.
-    out["hard_gate"] = (
-        (out["eps"] > 0)
-        & (out["price"] > 0)
-        & (out["market_cap"] > 0)
-    )
-
-    # Buy setup score: not a return prediction.
-    out["buy_setup_score"] = (
-        out["quality_score"] * 0.35
-        + out["growth_score"] * 0.20
-        + out["risk_value_score"] * 0.25
-    )
-
-    # Catalyst/technical fields, if supplied.
-    if "catalyst_score" in out.columns:
-        out["buy_setup_score"] += np.clip(out["catalyst_score"].fillna(0) / 10 * 10, 0, 10)
-    if "price_change_1m" in out.columns:
-        out["buy_setup_score"] += np.clip(
-            out["price_change_1m"].fillna(0).apply(lambda x: 5 if 0 < x <= 15 else 0), 0, 5
-        )
-
-    out["buy_setup_score"] = out["buy_setup_score"].clip(0, 100).round(1)
-
-    def buy_label(x, gate):
-        if not gate:
-            return "NO BUY — DATA/GATE FAIL"
-        if x >= 80:
-            return "STRONG BUY SETUP"
-        if x >= 70:
-            return "BUY / ACCUMULATE SETUP"
-        if x >= 60:
-            return "WATCH"
-        return "NO BUY SETUP"
-
-    out["buy_signal"] = [
-        buy_label(score, gate) for score, gate in zip(out["buy_setup_score"], out["hard_gate"])
-    ]
-
-    return out.sort_values(["multibagger_score", "buy_setup_score"], ascending=False)
+    # EBITDA Margin (>20% = 5 pts)
+    ebitda = row.get("ebitda", 0)
+    if rev > 0 and ebitda > 0:
+        ebitda_margin = (ebitda / rev) * 100
+        if ebitda_margin >= 20: bq_score += 5.0
+        elif ebitda_margin >= 12: bq_score += 3.0
+    else:
+        bq_score += 2.5
 
 
-def intrinsic_value(r, terminal_pe=10.0, eps_growth=20.0, years=3):
-    eps = r.get("eps", np.nan)
-    if pd.isna(eps) or eps <= 0:
-        return np.nan
-    future_eps = eps * (1 + eps_growth / 100) ** years
-    return future_eps * terminal_pe
+    # --- Category 2: Multibagger Potential (35 Points) ---
+    mp_score = 0.0
+
+    # Market Cap Scalability (Small/Mid-cap preference for PSX)
+    mcap = row.get("market_cap", 0)
+    if 0 < mcap <= 25_000_000_000: # <25 Billion PKR
+        mp_score += 7.0
+    elif 25_000_000_000 < mcap <= 75_000_000_000:
+        mp_score += 4.5
+    else:
+        mp_score += 2.0
+
+    # EPS CAGR (3Y or 5Y)
+    eps_3y = row.get("eps_3y_ago", 0)
+    if eps > 0 and eps_3y > 0:
+        eps_cagr = ((eps / eps_3y) ** (1/3) - 1) * 100
+        if eps_cagr >= 20: mp_score += 7.0
+        elif eps_cagr >= 12: mp_score += 4.0
+    else:
+        mp_score += 3.5
+
+    # Capacity Expansion & Utilization
+    cap_growth = row.get("capacity_growth", 0)
+    utilization = row.get("utilization", 0)
+    if cap_growth >= 15: mp_score += 7.0
+    elif cap_growth >= 5: mp_score += 4.0
+    else: mp_score += 2.0
+
+    if utilization >= 75: mp_score += 7.0
+    elif utilization >= 50: mp_score += 4.0
+    else: mp_score += 2.0
+
+    # Catalyst Score (Direct Input 1-7)
+    catalyst = row.get("catalyst_score", 4)
+    mp_score += min(max(catalyst, 0), 7.0)
 
 
-def scenario_table(r, years=3):
-    eps = r.get("eps", np.nan)
-    price = r.get("price", np.nan)
-    pe = r.get("pe", np.nan)
+    # --- Category 3: Risk & Valuation (35 Points) ---
+    rv_score = 0.0
 
-    if pd.isna(eps) or eps <= 0 or pd.isna(price):
-        return pd.DataFrame()
+    # Price to Earnings (P/E)
+    pe = row.get("pe", 0)
+    if 0 < pe <= 8: rv_score += 8.0  # Very attractive for PSX
+    elif 8 < pe <= 14: rv_score += 5.0
+    else: rv_score += 2.0
 
-    # Growth assumptions are scenario assumptions, not predictions.
-    scenarios = [
-        ("Bear", 8.0, 10.0),
-        ("Base", 18.0, 10.0),
-        ("Bull", 30.0, 12.0),
-    ]
+    # Debt / Cash Health
+    debt = row.get("debt", 0)
+    cash = row.get("cash", 0)
+    if debt == 0 or (cash > debt): rv_score += 8.0
+    elif ebitda > 0 and (debt / ebitda) < 2.0: rv_score += 5.0
+    else: rv_score += 2.0
 
-    rows = []
-    for name, growth, terminal_pe in scenarios:
-        future_eps = eps * (1 + growth / 100) ** years
-        future_value = future_eps * terminal_pe
-        upside = (future_value / price - 1) * 100
-        rows.append(
-            {
-                "Scenario": name,
-                "Assumed EPS CAGR": f"{growth:.0f}%",
-                "Terminal P/E": terminal_pe,
-                f"EPS in {years}Y": round(future_eps, 2),
-                f"Value in {years}Y": round(future_value, 2),
-                "Potential change": round(upside, 1),
-            }
-        )
-    return pd.DataFrame(rows)
+    # Dividend Yield
+    dy = row.get("dividend_yield", 0)
+    if dy >= 8.0: rv_score += 7.0
+    elif dy >= 4.0: rv_score += 4.0
+    else: rv_score += 1.0
 
+    # Governance Score (Direct Input 1-12)
+    gov = row.get("governance_score", 8)
+    rv_score += min(max(gov, 0), 12.0)
 
-def groq_analysis(row, scenario_df, api_key, model):
-    if not api_key or Groq is None:
-        return None
+    # --- Total Score & Classification ---
+    total_score = round(bq_score + mp_score + rv_score, 2)
+    
+    if total_score >= 85:
+        status = "Multibagger Candidate"
+    elif total_score >= 75:
+        status = "Watchlist"
+    elif total_score >= 65:
+        status = "Monitor"
+    else:
+        status = "No Multibagger Status"
 
-    client = Groq(api_key=api_key)
+    # Separate Buy Setup Score (1-100 scale calculation)
+    buy_setup = round(min(100.0, (total_score * 0.7) + (min(dy, 12) * 1.5) + (7 if pe > 0 and pe < 10 else 2)), 2)
 
-    data = row.to_dict()
-    # Keep prompt reasonably small.
-    safe_data = {}
-    for k, v in data.items():
-        if isinstance(v, (np.integer, np.floating)):
-            v = float(v)
-        if pd.notna(v) if not isinstance(v, str) else True:
-            safe_data[k] = v
+    return {
+        "bq_score": round(bq_score, 2),
+        "mp_score": round(mp_score, 2),
+        "rv_score": round(rv_score, 2),
+        "total_score": total_score,
+        "status": status,
+        "buy_setup_score": buy_setup
+    }
 
-    prompt = f"""
-You are a Pakistan Stock Exchange equity research analyst.
-Analyze the supplied company using a neutral, evidence-based framework.
+# -----------------------------------------------------------------------------
+# 4. GROQ RESEARCH NOTE GENERATOR
+# -----------------------------------------------------------------------------
 
-IMPORTANT:
-- Do not guarantee returns.
-- Do not claim that a stock must hit a target.
-- Do not say it will definitely return 10% per month.
-- Clearly distinguish reported data from assumptions.
-- Identify missing data.
-- Focus on earnings quality, valuation, catalyst, balance sheet, cash flow,
-  execution risks, and what would invalidate the thesis.
+def generate_groq_research_note(api_key: str, company_data: dict, scores: dict) -> str:
+    """Generates an equity research note using Groq API."""
+    try:
+        client = Groq(api_key=api_key)
+        prompt = f"""
+        Act as a Senior Equity Analyst covering the Pakistan Stock Exchange (PSX).
+        Write a concise research note for the following company analyzed under the 100-Point Multibagger Framework:
 
-Company data:
-{json.dumps(safe_data, default=str, indent=2)}
+        Company Metadata & Metrics:
+        {json.dumps(company_data, indent=2, default=str)}
 
-Scenario model:
-{scenario_df.to_dict(orient="records") if not scenario_df.empty else "Unavailable"}
+        Engine Scores:
+        - Total Multibagger Score: {scores['total_score']}/100
+        - Classification: {scores['status']}
+        - Business Quality Score: {scores['bq_score']}/30
+        - Multibagger Potential Score: {scores['mp_score']}/35
+        - Risk & Valuation Score: {scores['rv_score']}/35
+        - Buy Setup Score: {scores['buy_setup_score']}/100
 
-Return these headings:
-1. Investment thesis
-2. Earnings drivers
-3. Valuation
-4. Catalysts
-5. Key risks
-6. Thesis-break triggers
-7. Data gaps
-8. What to monitor next quarter
-"""
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a rigorous PSX equity research analyst."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    return response.choices[0].message.content
-
-
-# ---------------- UI ----------------
-st.title("📈 PSX Multibagger Engine")
-st.caption(
-    "Quantitative PSX screening + valuation scenarios + Groq research notes. "
-    "No return guarantee: scores are decision-support signals, not promises."
-)
-
-with st.sidebar:
-    st.header("⚙️ Settings")
-
-    api_key = st.text_input(
-        "Groq API Key",
-        value=os.getenv("GROQ_API_KEY", ""),
-        type="password",
-        help="You can also set GROQ_API_KEY in Streamlit secrets/environment variables.",
-    )
-
-    model = st.selectbox(
-        "Groq model",
-        [
-            "llama-3.3-70b-versatile",
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-        ],
-        index=0,
-    )
-
-    st.divider()
-    st.markdown("### Score gates")
-    st.write("85+ → Multibagger Candidate")
-    st.write("75–84 → Watchlist")
-    st.write("65–74 → Monitor")
-    st.write("<65 → No Multibagger Status")
-
-    st.divider()
-    st.info(
-        "The app does not promise 10% monthly returns or guaranteed multibaggers. "
-        "Historical back-testing should be used before treating the score as a strategy."
-    )
-
-tab1, tab2, tab3 = st.tabs(["📂 Data", "🔎 Screen", "🧠 Research"])
-
-with tab1:
-    st.subheader("Load PSX data")
-    uploaded = st.file_uploader(
-        "Upload PSX fundamentals CSV or Excel",
-        type=["csv", "xlsx", "xls"],
-    )
-
-    pasted = st.text_area(
-        "Or paste CSV data",
-        height=180,
-        placeholder="ticker,company,price,market_cap,eps,eps_prev,revenue,revenue_prev,roe,roic,...",
-    )
-
-    st.markdown("**Recommended fields:**")
-    st.code(DEFAULT_COLUMNS_HELP)
-
-    df = None
-    if uploaded is not None:
-        try:
-            if uploaded.name.lower().endswith(".csv"):
-                uploaded.seek(0)
-                df = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8-sig")
-            else:
-                df = pd.read_excel(uploaded)
-            st.success(f"Loaded {len(df):,} rows from {uploaded.name}")
-        except Exception as e:
-            st.error(f"Could not read the file: {e}")
-
-    elif pasted.strip():
-        try:
-            df = pd.read_csv(io.StringIO(pasted))
-            st.success(f"Loaded {len(df):,} rows from pasted CSV.")
-        except Exception as e:
-            st.error(f"Could not parse pasted CSV: {e}")
-
-    if df is not None:
-        try:
-            df = normalize_df(df)
-            st.session_state["raw_df"] = df
-            st.dataframe(df.head(20), use_container_width=True)
-        except Exception as e:
-            st.error(str(e))
-
-    st.markdown(
+        Provide:
+        1. Executive Summary & Investment Thesis
+        2. Financial Highlights & Growth Drivers
+        3. Key Risks (Macro, Currency, Sector Specific to Pakistan)
+        4. Valuation Context & Final Verdict
         """
-**Important:** The app does not scrape PSX automatically by default. This avoids
-silently depending on an undocumented endpoint and lets you control the data source.
-You can export/supply PSX data and run the model locally or on Streamlit Cloud.
-"""
-    )
-
-with tab2:
-    st.subheader("Run the Multibagger Engine")
-
-    if "raw_df" not in st.session_state:
-        st.warning("Load a CSV/Excel file or paste CSV data in the Data tab first.")
-    else:
-        raw = st.session_state["raw_df"]
-
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            min_mcap = st.number_input(
-                "Minimum market cap (PKR bn)",
-                min_value=0.0,
-                value=0.0,
-                step=1.0,
-            )
-        with col2:
-            max_mcap = st.number_input(
-                "Maximum market cap (PKR bn)",
-                min_value=0.0,
-                value=500.0,
-                step=5.0,
-            )
-        with col3:
-            min_score = st.slider("Minimum Multibagger Score", 0, 100, 65)
-        with col4:
-            only_gate = st.checkbox("Only hard-gate pass", value=True)
-
-        work = raw.copy()
-        work = work[
-            (work["market_cap"] >= min_mcap * 1e9)
-            & (work["market_cap"] <= max_mcap * 1e9)
-        ]
-
-        scored = calculate_scores(work)
-        if only_gate:
-            scored = scored[scored["hard_gate"]]
-
-        scored = scored[scored["multibagger_score"] >= min_score]
-
-        display_cols = [
-            "ticker", "company", "price", "market_cap",
-            "eps", "roe", "pe",
-            "quality_score", "growth_score", "risk_value_score",
-            "multibagger_score", "buy_setup_score",
-            "status", "buy_signal",
-        ]
-        display_cols = [c for c in display_cols if c in scored.columns]
-
-        st.markdown("### Results")
-        st.dataframe(
-            scored[display_cols],
-            use_container_width=True,
-            hide_index=True,
+        
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=800
         )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return f"Error generating research note via Groq: {str(e)}"
 
-        csv = scored.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download scored stocks CSV",
-            data=csv,
-            file_name="psx_multibagger_scores.csv",
-            mime="text/csv",
-        )
+# -----------------------------------------------------------------------------
+# 5. STREAMLIT APPLICATION USER INTERFACE
+# -----------------------------------------------------------------------------
 
-        st.markdown("### Top candidates")
-        top = scored.head(10)
-        if top.empty:
-            st.info("No companies meet the selected filters. Relax the filters or add more data.")
-        else:
-            cols = st.columns(min(5, len(top)))
-            for i, (_, r) in enumerate(top.iterrows()):
-                with cols[i % len(cols)]:
-                    st.metric(
-                        label=str(r["ticker"]),
-                        value=f'{r["multibagger_score"]:.1f}/100',
-                        delta=str(r["buy_signal"]),
-                    )
+def main():
+    st.title("🇵🇰 PSX Multibagger Engine")
+    st.markdown("Screen Pakistan Stock Exchange companies using a 100-point multibagger framework and Groq AI research.")
 
-with tab3:
-    st.subheader("Company-level research")
+    # Sidebar: Setup & API Config
+    st.sidebar.header("⚙️ Configuration")
+    api_key_env = os.environ.get("GROQ_API_KEY", "")
+    groq_key = st.sidebar.text_input("Groq API Key", value=api_key_env, type="password", help="Enter key or set GROQ_API_KEY env variable")
+    
+    st.sidebar.markdown("---")
+    data_source = st.sidebar.radio("Data Source Option", ["Upload File / Paste CSV", "Direct Fetch from PSX Portal"])
 
-    if "raw_df" not in st.session_state:
-        st.warning("Load data first.")
+    df_raw = None
+
+    if data_source == "Upload File / Paste CSV":
+        st.subheader("📁 Data Input")
+        upload_tab, paste_tab = st.tabs(["Upload CSV / Excel", "Paste Raw Data"])
+
+        with upload_tab:
+            uploaded_file = st.file_uploader("Upload CSV, XLSX, or XLS file", type=["csv", "xlsx", "xls"])
+            if uploaded_file:
+                try:
+                    if uploaded_file.name.endswith(".csv"):
+                        df_raw = pd.read_csv(uploaded_file)
+                    else:
+                        df_raw = pd.read_excel(uploaded_file)
+                except Exception as e:
+                    st.error(f"Error loading file: {e}")
+
+        with paste_tab:
+            pasted_text = st.text_area("Paste CSV content here", height=150, placeholder="ticker,price,market_cap,eps\nOGDC,120.5,518000000000,28.4")
+            if pasted_text:
+                try:
+                    from io import StringIO
+                    df_raw = pd.read_csv(StringIO(pasted_text))
+                except Exception as e:
+                    st.error(f"Error parsing pasted CSV: {e}")
+
     else:
-        scored = calculate_scores(st.session_state["raw_df"])
-        tickers = scored["ticker"].astype(str).tolist()
-
-        if not tickers:
-            st.info("No tickers available.")
-        else:
-            selected = st.selectbox("Select stock", tickers)
-            r = scored[scored["ticker"].astype(str) == selected].iloc[0]
-
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Multibagger Score", f'{r["multibagger_score"]:.1f}/100')
-            c2.metric("Quality", f'{r["quality_score"]:.1f}/30')
-            c3.metric("Growth", f'{r["growth_score"]:.1f}/35')
-            c4.metric("Risk/Value", f'{r["risk_value_score"]:.1f}/35')
-            c5.metric("Buy Setup", f'{r["buy_setup_score"]:.1f}/100')
-
-            st.markdown(f"### {r['ticker']} — {r.get('company', '')}")
-            st.write(f"**Status:** {r['status']}  |  **Buy signal:** {r['buy_signal']}")
-
-            scenarios = scenario_table(r, years=3)
-            if not scenarios.empty:
-                st.markdown("### 3-year scenario framework")
-                st.dataframe(scenarios, use_container_width=True, hide_index=True)
-                st.caption(
-                    "Scenario values are mathematical illustrations using assumed EPS CAGR "
-                    "and terminal P/E. They are not forecasts or guarantees."
-                )
-
-            st.markdown("### Thesis-break checklist")
-            st.markdown(
-                """
-- Earnings growth materially below the thesis for multiple reporting periods.
-- Major expansion/capacity project delayed, cancelled, or economics deteriorate.
-- Leverage rises beyond the company's sustainable capacity.
-- Operating cash flow persistently diverges from reported profit.
-- Governance/accounting issue materially changes the investment case.
-- Valuation becomes disconnected from achievable earnings.
-"""
-            )
-
-            if st.button("🧠 Generate Groq research note", type="primary"):
-                if not api_key:
-                    st.warning("Enter a Groq API key in the sidebar first.")
-                elif Groq is None:
-                    st.error("Groq package is unavailable. Reinstall requirements.txt.")
+        st.subheader("🌐 Direct PSX Web Data Fetch")
+        symbol_input = st.text_input("Enter PSX Symbol (e.g., OGDC, SYS, LUCK, ENGRO):", value="OGDC")
+        if st.button("Fetch Live Data from PSX Portal"):
+            with st.spinner("Scraping PSX Web Portal..."):
+                psx_data = fetch_psx_web_data(symbol_input)
+                if "error" in psx_data:
+                    st.error(psx_data["error"])
                 else:
-                    with st.spinner("Generating research note..."):
-                        try:
-                            note = groq_analysis(r, scenarios, api_key, model)
-                            st.markdown(note)
-                        except Exception as e:
-                            st.error(f"Groq request failed: {e}")
+                    st.success("Successfully fetched data!")
+                    df_raw = pd.DataFrame([psx_data])
 
-st.divider()
-st.caption(
-    f"PSX Multibagger Engine | Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} | "
-    "For research/decision support only."
-)
+    # Processing and Display Logic
+    if df_raw is not None and not df_raw.empty:
+        df_clean = standardize_columns(df_raw)
+        
+        # Verify Minimum Required Columns
+        req_cols = ["ticker", "price", "market_cap", "eps"]
+        missing = [col for col in req_cols if col not in df_clean.columns]
+
+        if missing:
+            st.warning(f"Missing required columns: {missing}. Standardized columns available: {list(df_clean.columns)}")
+        else:
+            # Process Scores
+            evaluated_list = []
+            for _, row in df_clean.iterrows():
+                scores = evaluate_multibagger(row)
+                full_row = {**row.to_dict(), **scores}
+                evaluated_list.append(full_row)
+
+            results_df = pd.DataFrame(evaluated_list)
+
+            st.markdown("---")
+            st.subheader("📊 Multibagger Screening Results")
+
+            # Score Summary Cards
+            col1, col2, col3, col4 = st.columns(4)
+            total_count = len(results_df)
+            candidates = len(results_df[results_df["status"] == "Multibagger Candidate"])
+            watchlist = len(results_df[results_df["status"] == "Watchlist"])
+            
+            col1.metric("Total Screened", total_count)
+            col2.metric("Multibagger Candidates", candidates)
+            col3.metric("Watchlist", watchlist)
+            col4.metric("Avg Score", f"{results_df['total_score'].mean():.1f}/100")
+
+            # Display Primary Table
+            display_cols = ["ticker", "price", "market_cap", "eps", "total_score", "status", "buy_setup_score", "bq_score", "mp_score", "rv_score"]
+            avail_display_cols = [c for c in display_cols if c in results_df.columns]
+            
+            st.dataframe(
+                results_df[avail_display_cols].sort_values(by="total_score", ascending=False),
+                use_container_width=True
+            )
+
+            # --- AI Research Note Generation Section ---
+            st.markdown("---")
+            st.subheader("🤖 Groq AI Equity Research Note")
+
+            selected_ticker = st.selectbox("Select ticker for research note:", results_df["ticker"].unique())
+            
+            if st.button("Generate Research Note"):
+                if not groq_key:
+                    st.error("Please provide a Groq API Key in the sidebar or via GROQ_API_KEY environment variable.")
+                else:
+                    selected_data = results_df[results_df["ticker"] == selected_ticker].iloc[0].to_dict()
+                    scores_data = {
+                        "bq_score": selected_data["bq_score"],
+                        "mp_score": selected_data["mp_score"],
+                        "rv_score": selected_data["rv_score"],
+                        "total_score": selected_data["total_score"],
+                        "status": selected_data["status"],
+                        "buy_setup_score": selected_data["buy_setup_score"]
+                    }
+                    
+                    with st.spinner(f"Generating Groq research note for {selected_ticker}..."):
+                        note = generate_groq_research_note(groq_key, selected_data, scores_data)
+                        st.markdown(note)
+
+    else:
+        st.info("Please upload a dataset, paste CSV data, or fetch a symbol directly from the sidebar to begin screening.")
+
+if __name__ == "__main__":
+    main()
