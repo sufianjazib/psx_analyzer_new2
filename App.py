@@ -124,24 +124,51 @@ def fetch_psx_web_data(symbol: str) -> dict:
 # -----------------------------------------------------------------------------
 
 def evaluate_multibagger(row: pd.Series) -> dict:
-    """Calculates Business Quality, Multibagger Potential, and Risk/Valuation scores."""
+    """Calculates Business Quality, Multibagger Potential, and Risk/Valuation scores safely."""
     
+    # Helper function to convert any missing, NaN, or non-numeric value safely to float
+    def safe_val(key, default=0.0):
+        val = row.get(key, default)
+        if pd.isna(val) or val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    # Extract clean numeric values
+    revenue = safe_val("revenue")
+    revenue_prev = safe_val("revenue_prev")
+    eps = safe_val("eps")
+    eps_prev = safe_val("eps_prev")
+    eps_3y = safe_val("eps_3y_ago")
+    roe = safe_val("roe")
+    roic = safe_val("roic")
+    ocf = safe_val("operating_cash_flow")
+    pat = safe_val("net_profit")
+    ebitda = safe_val("ebitda")
+    mcap = safe_val("market_cap")
+    cap_growth = safe_val("capacity_growth")
+    utilization = safe_val("utilization")
+    catalyst = safe_val("catalyst_score", 4.0)
+    pe = safe_val("pe")
+    debt = safe_val("debt")
+    cash = safe_val("cash")
+    dy = safe_val("dividend_yield")
+    gov = safe_val("governance_score", 8.0)
+
     # --- Category 1: Business Quality (30 Points) ---
     bq_score = 0.0
-    
+
     # Revenue Growth (>15% = 5 pts, >10% = 3 pts)
-    rev = row.get("revenue", 0)
-    rev_prev = row.get("revenue_prev", 0)
-    if rev > 0 and rev_prev > 0:
-        rev_growth = ((rev - rev_prev) / rev_prev) * 100
+    if revenue > 0 and revenue_prev > 0:
+        rev_growth = ((revenue - revenue_prev) / revenue_prev) * 100
         if rev_growth >= 15: bq_score += 5.0
         elif rev_growth >= 10: bq_score += 3.0
     else:
-        bq_score += 2.5 # Neutral fallback
+        bq_score += 2.5
 
     # EPS Growth (>15% = 5 pts)
-    eps = row.get("eps", 0)
-    eps_prev = row.get("eps_prev", 0)
     if eps > 0 and eps_prev > 0:
         eps_growth = ((eps - eps_prev) / eps_prev) * 100
         if eps_growth >= 15: bq_score += 5.0
@@ -150,18 +177,14 @@ def evaluate_multibagger(row: pd.Series) -> dict:
         bq_score += 2.5
 
     # ROE (>20% = 5 pts, >15% = 3 pts)
-    roe = row.get("roe", 0)
     if roe >= 20: bq_score += 5.0
     elif roe >= 15: bq_score += 3.0
 
     # ROIC (>18% = 5 pts)
-    roic = row.get("roic", 0)
     if roic >= 18: bq_score += 5.0
     elif roic >= 12: bq_score += 3.0
 
     # OCF vs Net Profit Quality (>1.0 = 5 pts)
-    ocf = row.get("operating_cash_flow", 0)
-    pat = row.get("net_profit", 0)
     if pat > 0 and ocf > 0:
         if (ocf / pat) >= 1.0: bq_score += 5.0
         elif (ocf / pat) >= 0.7: bq_score += 3.0
@@ -169,9 +192,8 @@ def evaluate_multibagger(row: pd.Series) -> dict:
         bq_score += 2.5
 
     # EBITDA Margin (>20% = 5 pts)
-    ebitda = row.get("ebitda", 0)
-    if rev > 0 and ebitda > 0:
-        ebitda_margin = (ebitda / rev) * 100
+    if revenue > 0 and ebitda > 0:
+        ebitda_margin = (ebitda / revenue) * 100
         if ebitda_margin >= 20: bq_score += 5.0
         elif ebitda_margin >= 12: bq_score += 3.0
     else:
@@ -181,17 +203,15 @@ def evaluate_multibagger(row: pd.Series) -> dict:
     # --- Category 2: Multibagger Potential (35 Points) ---
     mp_score = 0.0
 
-    # Market Cap Scalability (Small/Mid-cap preference for PSX)
-    mcap = row.get("market_cap", 0)
-    if 0 < mcap <= 25_000_000_000: # <25 Billion PKR
+    # Market Cap Scalability
+    if 0 < mcap <= 25_000_000_000:
         mp_score += 7.0
     elif 25_000_000_000 < mcap <= 75_000_000_000:
         mp_score += 4.5
     else:
         mp_score += 2.0
 
-    # EPS CAGR (3Y or 5Y)
-    eps_3y = row.get("eps_3y_ago", 0)
+    # EPS CAGR
     if eps > 0 and eps_3y > 0:
         eps_cagr = ((eps / eps_3y) ** (1/3) - 1) * 100
         if eps_cagr >= 20: mp_score += 7.0
@@ -200,8 +220,6 @@ def evaluate_multibagger(row: pd.Series) -> dict:
         mp_score += 3.5
 
     # Capacity Expansion & Utilization
-    cap_growth = row.get("capacity_growth", 0)
-    utilization = row.get("utilization", 0)
     if cap_growth >= 15: mp_score += 7.0
     elif cap_growth >= 5: mp_score += 4.0
     else: mp_score += 2.0
@@ -210,51 +228,40 @@ def evaluate_multibagger(row: pd.Series) -> dict:
     elif utilization >= 50: mp_score += 4.0
     else: mp_score += 2.0
 
-    # Catalyst Score (Direct Input 1-7)
-    catalyst = row.get("catalyst_score", 4)
-    mp_score += min(max(catalyst, 0), 7.0)
+    # Catalyst Score
+    mp_score += min(max(catalyst, 0.0), 7.0)
 
 
     # --- Category 3: Risk & Valuation (35 Points) ---
     rv_score = 0.0
 
-    # Price to Earnings (P/E)
-    pe = row.get("pe", 0)
-    if 0 < pe <= 8: rv_score += 8.0  # Very attractive for PSX
+    # P/E Ratio
+    if 0 < pe <= 8: rv_score += 8.0
     elif 8 < pe <= 14: rv_score += 5.0
     else: rv_score += 2.0
 
     # Debt / Cash Health
-    debt = row.get("debt", 0)
-    cash = row.get("cash", 0)
     if debt == 0 or (cash > debt): rv_score += 8.0
     elif ebitda > 0 and (debt / ebitda) < 2.0: rv_score += 5.0
     else: rv_score += 2.0
 
     # Dividend Yield
-    dy = row.get("dividend_yield", 0)
     if dy >= 8.0: rv_score += 7.0
     elif dy >= 4.0: rv_score += 4.0
     else: rv_score += 1.0
 
-    # Governance Score (Direct Input 1-12)
-    gov = row.get("governance_score", 8)
-    rv_score += min(max(gov, 0), 12.0)
+    # Governance Score
+    rv_score += min(max(gov, 0.0), 12.0)
 
-    # --- Total Score & Classification ---
+    # --- Classification & Scores ---
     total_score = round(bq_score + mp_score + rv_score, 2)
     
-    if total_score >= 85:
-        status = "Multibagger Candidate"
-    elif total_score >= 75:
-        status = "Watchlist"
-    elif total_score >= 65:
-        status = "Monitor"
-    else:
-        status = "No Multibagger Status"
+    if total_score >= 85: status = "Multibagger Candidate"
+    elif total_score >= 75: status = "Watchlist"
+    elif total_score >= 65: status = "Monitor"
+    else: status = "No Multibagger Status"
 
-    # Separate Buy Setup Score (1-100 scale calculation)
-    buy_setup = round(min(100.0, (total_score * 0.7) + (min(dy, 12) * 1.5) + (7 if pe > 0 and pe < 10 else 2)), 2)
+    buy_setup = round(min(100.0, (total_score * 0.7) + (min(dy, 12) * 1.5) + (7 if 0 < pe < 10 else 2)), 2)
 
     return {
         "bq_score": round(bq_score, 2),
