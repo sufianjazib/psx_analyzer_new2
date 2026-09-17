@@ -138,12 +138,14 @@ def extract_financials_via_groq(api_key: str, raw_html_text: str) -> dict:
     )
     return json.loads(completion.choices[0].message.content)
     with st.expander("🛠️ Adjust Qualitative Inputs (Governance & Catalysts)"):
-    col_a, col_b = st.columns(2)
-    gov_input = col_a.slider("Governance Score", 0, 12, 8)
-    cat_input = col_b.slider("Catalyst Score", 0, 7, 4)
+        col_a, col_b = st.columns(2)
+        gov_input = col_a.slider("Governance Score", 0, 12, 8)
+        cat_input = col_b.slider("Catalyst Score", 0, 7, 4)
 
-    # Pass manual adjustments into evaluation engine
-    selected_row["governance_score"] = gov_input
+        # Pass manual adjustments into evaluation engine
+        selected_row["governance_score"] = gov_input
+        selected_row["catalyst_score"] = cat_input
+        updated_scores = evaluate_multibagger(selected_row)
     selected_row["catalyst_score"] = cat_input
     updated_scores = evaluate_multibagger(selected_row)
     selected_row["catalyst_score"] = cat_input
