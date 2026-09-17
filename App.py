@@ -62,100 +62,88 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
 # 2. PSX WEB DATA SCRAPER
 # -----------------------------------------------------------------------------
 
-@st.cache_data(ttl=900)
-def fetch_complete_psx_data(symbol: str) -> dict:
+@st.cache_data(ttl=900)  # Cache results for 15 minutes
+def fetch_psx_web_data(symbol: str) -> dict:
     """
-    Fetches both live quote stats and deep financial ratios from PSX.
+    Directly scrapes live stock quote and stat data from the PSX Portal.
     """
     symbol = symbol.strip().upper()
     url = f"https://dps.psx.com.pk/company/{symbol}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
 
     try:
-        res = requests.get(url, headers=headers, timeout=12)
-        if res.status_code != 200:
-            return {"error": f"Symbol '{symbol}' not found on PSX."}
+        response = requests.get(url, headers=headers, timeout=12)
+        if response.status_code != 200:
+            return {"error": f"Symbol '{symbol}' not found or PSX Portal unavailable."}
 
-        soup = BeautifulSoup(res.text, "html.parser")
-        data = {"ticker": symbol}
+        soup = BeautifulSoup(response.text, "html.parser")
+        html_text = response.text
 
-        # Parse key numerical tables across the page
-        tables = soup.find_all("table")
-        for table in tables:
-            rows = table.find_all("tr")
-            for row in rows:
-                cols = [ele.text.strip() for ele in row.find_all(["td", "th"])]
-                if len(cols) >= 2:
-                    label, val = cols[0].lower(), cols[1].replace(",", "")
-                    
-                    if "roe" in label or "return on equity" in label:
-                        data["roe"] = safe_float(val)
-                    elif "roic" in label:
-                        data["roic"] = safe_float(val)
-                    elif "operating cash" in label:
-                        data["operating_cash_flow"] = safe_float(val)
-                    elif "net profit" in label or "pat" in label:
-                        data["net_profit"] = safe_float(val)
-                    elif "total debt" in label:
-                        data["debt"] = safe_float(val)
+        # 1. Parse Stock Price
+        price = None
+        price_elem = soup.find("div", class_="quote__close") or soup.find("div", class_="stats_value")
+        if price_elem:
+            p_match = re.search(r"[\d,]+\.?\d*", price_elem.text)
+            if p_match:
+                price = float(p_match.group(0).replace(",", ""))
 
-        # Merge basic quote data
-        base_quote = fetch_psx_web_data(symbol)
-        return {**base_quote, **data}
+        # 2. Helper to extract metrics via Regex
+        def extract_metric(patterns, text_source):
+            for pat in patterns:
+                match = re.search(pat, text_source, re.IGNORECASE)
+                if match:
+                    val_str = match.group(1).replace(",", "").strip()
+                    try:
+                        return float(val_str)
+                    except ValueError:
+                        continue
+            return None
+
+        mcap = extract_metric([
+            r'Market\s*Cap(?:italisation)?\s*<\/div>\s*<div[^>]*>\s*Rs\.?\s*([\d,]+)',
+            r'Market\s*Cap[^\d]*([\d,]+)'
+        ], html_text)
+
+        eps = extract_metric([
+            r'EPS\s*\(TTM\)\s*<\/div>\s*<div[^>]*>\s*Rs\.?\s*(-?[\d\.]+)',
+            r'EPS[^\d]*(-?[\d\.]+)'
+        ], html_text)
+
+        pe = extract_metric([
+            r'P\/E\s*Ratio\s*<\/div>\s*<div[^>]*>\s*([\d\.]+)',
+            r'P\/E[^\d]*([\d\.]+)'
+        ], html_text)
+
+        dy = extract_metric([
+            r'Div(?:idend)?\s*Yield\s*<\/div>\s*<div[^>]*>\s*([\d\.]+)%',
+            r'Yield[^\d]*([\d\.]+)'
+        ], html_text) or 0.0
+
+        if pe is None and price and eps and eps > 0:
+            pe = round(price / eps, 2)
+
+        return {
+            "ticker": symbol,
+            "price": price,
+            "market_cap": mcap,
+            "eps": eps,
+            "pe": pe,
+            "dividend_yield": dy,
+            "source": "PSX Data Portal"
+        }
 
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Failed to fetch data for '{symbol}': {str(e)}"}
 
-def safe_float(val):
-    try:
-        clean = re.sub(r'[^\d.-]', '', str(val))
-        return float(clean) if clean else None
-    except:
-        return None
-
-def extract_financials_via_groq(api_key: str, raw_html_text: str) -> dict:
-    """Uses Groq LLM to parse unstructured text into clean JSON metrics."""
-    client = Groq(api_key=api_key)
-    prompt = f"""
-    Extract key financial figures from this PSX text snippet and return ONLY a JSON object:
-    Text: {raw_html_text[:3000]}
-
-    Return JSON format:
-    {{
-        "revenue": float or null,
-        "revenue_prev": float or null,
-        "net_profit": float or null,
-        "roe": float or null,
-        "operating_cash_flow": float or null,
-        "debt": float or null
-    }}
-    """
-    
-    completion = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}
-    )
-    return json.loads(completion.choices[0].message.content)
-    with st.expander("🛠️ Adjust Qualitative Inputs (Governance & Catalysts)"):
-        col_a, col_b = st.columns(2)
-        gov_input = col_a.slider("Governance Score", 0, 12, 8)
-        cat_input = col_b.slider("Catalyst Score", 0, 7, 4)
-
-        # Pass manual adjustments into evaluation engine
-        selected_row["governance_score"] = gov_input
-        selected_row["catalyst_score"] = cat_input
-        updated_scores = evaluate_multibagger(selected_row)
-    selected_row["catalyst_score"] = cat_input
-    updated_scores = evaluate_multibagger(selected_row)
-    selected_row["catalyst_score"] = cat_input
-    updated_scores = evaluate_multibagger(selected_row)
 # -----------------------------------------------------------------------------
-# 3. MULTIBAGGER EVALUATION ENGINE (100-POINT FRAMEWORK)
+# 3. MULTIBAGGER EVALUATION ENGINE
 # -----------------------------------------------------------------------------
 
 def evaluate_multibagger(row: pd.Series) -> dict:
-    """Calculates scores dynamically based on whether full or basic scraped data is available."""
+    """Calculates Business Quality, Multibagger Potential, and Risk/Valuation scores safely."""
     
     def safe_val(key, default=None):
         val = row.get(key, None)
@@ -166,16 +154,14 @@ def evaluate_multibagger(row: pd.Series) -> dict:
         except (ValueError, TypeError):
             return default
 
-    # Core Metrics
     mcap = safe_val("market_cap", 0.0)
     pe = safe_val("pe", 0.0)
     dy = safe_val("dividend_yield", 0.0)
     eps = safe_val("eps", 0.0)
-    eps_prev = safe_val("eps_prev", None)
     
-    # Extended Financial Metrics
     revenue = safe_val("revenue", None)
     revenue_prev = safe_val("revenue_prev", None)
+    eps_prev = safe_val("eps_prev", None)
     roe = safe_val("roe", None)
     roic = safe_val("roic", None)
     ocf = safe_val("operating_cash_flow", None)
@@ -185,111 +171,64 @@ def evaluate_multibagger(row: pd.Series) -> dict:
     cash = safe_val("cash", None)
     cap_growth = safe_val("capacity_growth", None)
     utilization = safe_val("utilization", None)
-    catalyst = safe_val("catalyst_score", 4.0)
+    catalyst = safe_val("catalyst_score", 5.0)
     gov = safe_val("governance_score", 8.0)
 
-    # Detect if extended fundamental data is provided
-    has_extended_data = any(v is not None for v in [revenue, roe, roic, ocf, debt])
+    has_full_data = any(v is not None for v in [revenue, roe, roic, ocf, debt])
 
-    # ---------------------------------------------------------
-    # 1. Business Quality (30 Points)
-    # ---------------------------------------------------------
-    bq_score = 0.0
-    if has_extended_data:
+    if has_full_data:
+        bq_score = 0.0
         if revenue and revenue_prev and revenue_prev > 0:
-            rev_growth = ((revenue - revenue_prev) / revenue_prev) * 100
-            if rev_growth >= 15: bq_score += 5.0
-            elif rev_growth >= 10: bq_score += 3.0
+            rev_g = ((revenue - revenue_prev) / revenue_prev) * 100
+            bq_score += 5.0 if rev_g >= 15 else (3.0 if rev_g >= 10 else 1.0)
         else: bq_score += 2.5
 
         if eps > 0 and eps_prev and eps_prev > 0:
-            eps_growth = ((eps - eps_prev) / eps_prev) * 100
-            if eps_growth >= 15: bq_score += 5.0
-            elif eps_growth >= 8: bq_score += 3.0
+            eps_g = ((eps - eps_prev) / eps_prev) * 100
+            bq_score += 5.0 if eps_g >= 15 else (3.0 if eps_g >= 8 else 1.0)
         else: bq_score += 2.5
 
-        if roe:
-            if roe >= 20: bq_score += 5.0
-            elif roe >= 15: bq_score += 3.0
-        else: bq_score += 2.5
-
-        if roic:
-            if roic >= 18: bq_score += 5.0
-            elif roic >= 12: bq_score += 3.0
-        else: bq_score += 2.5
-
+        bq_score += 5.0 if (roe and roe >= 20) else (3.0 if (roe and roe >= 15) else 1.0)
+        bq_score += 5.0 if (roic and roic >= 18) else (3.0 if (roic and roic >= 12) else 1.0)
+        
         if pat and ocf and pat > 0:
-            if (ocf / pat) >= 1.0: bq_score += 5.0
-            elif (ocf / pat) >= 0.7: bq_score += 3.0
+            bq_score += 5.0 if (ocf / pat) >= 1.0 else (3.0 if (ocf / pat) >= 0.7 else 1.0)
         else: bq_score += 2.5
 
         if revenue and ebitda and revenue > 0:
-            ebitda_margin = (ebitda / revenue) * 100
-            if ebitda_margin >= 20: bq_score += 5.0
-            elif ebitda_margin >= 12: bq_score += 3.0
+            bq_score += 5.0 if (ebitda / revenue) * 100 >= 20 else 3.0
         else: bq_score += 2.5
+
+        mp_score = 0.0
+        mp_score += 7.0 if 0 < mcap <= 25_000_000_000 else (4.5 if mcap <= 75_000_000_000 else 2.0)
+        mp_score += 7.0 if (cap_growth and cap_growth >= 15) else 4.0
+        mp_score += 7.0 if (utilization and utilization >= 75) else 4.0
+        mp_score += min(max(catalyst, 0.0), 7.0) + 7.0
+
+        rv_score = 0.0
+        rv_score += 8.0 if 0 < pe <= 8 else (5.0 if pe <= 14 else 2.0)
+        rv_score += 8.0 if (debt == 0 or (cash and debt and cash > debt)) else 4.0
+        rv_score += 7.0 if dy >= 8.0 else (4.0 if dy >= 4.0 else 1.0)
+        rv_score += min(max(gov, 0.0), 12.0)
+
     else:
-        # Quick Estimate for Scraped Data: infer business quality from earnings valuation profile
-        if eps > 0 and pe > 0:
-            if pe < 10: bq_score = 22.0
-            elif pe < 18: bq_score = 18.0
-            else: bq_score = 12.0
-        else:
-            bq_score = 15.0
+        # Dynamic Scaling for Scraped Web Summaries
+        if 0 < pe <= 5: bq_score = 36.0
+        elif 5 < pe <= 8: bq_score = 30.0
+        elif 8 < pe <= 12: bq_score = 24.0
+        elif 12 < pe <= 20: bq_score = 18.0
+        else: bq_score = 10.0
 
-    # ---------------------------------------------------------
-    # 2. Multibagger Potential (35 Points)
-    # ---------------------------------------------------------
-    mp_score = 0.0
-    
-    # Market Cap Scalability
-    if 0 < mcap <= 25_000_000_000: mp_score += 10.0
-    elif 25_000_000_000 < mcap <= 75_000_000_000: mp_score += 7.0
-    elif mcap > 75_000_000_000: mp_score += 4.0
-    else: mp_score += 5.0
+        if dy >= 10.0: rv_score = 28.0
+        elif dy >= 6.0: rv_score = 22.0
+        elif dy >= 3.0: rv_score = 15.0
+        else: rv_score = 8.0
 
-    # Capacity / Catalyst / Growth Metrics
-    if cap_growth:
-        if cap_growth >= 15: mp_score += 9.0
-        elif cap_growth >= 5: mp_score += 5.0
-        else: mp_score += 2.0
-    else: mp_score += 6.0
+        if 0 < mcap <= 30_000_000_000: mp_score = 26.0
+        elif 30_000_000_000 < mcap <= 100_000_000_000: mp_score = 22.0
+        elif mcap > 100_000_000_000: mp_score = 18.0
+        else: mp_score = 15.0
 
-    if utilization:
-        if utilization >= 75: mp_score += 9.0
-        elif utilization >= 50: mp_score += 5.0
-        else: mp_score += 2.0
-    else: mp_score += 6.0
-
-    mp_score += min(max(catalyst, 0.0), 7.0)
-
-    # ---------------------------------------------------------
-    # 3. Risk & Valuation (35 Points)
-    # ---------------------------------------------------------
-    rv_score = 0.0
-
-    # P/E Evaluation
-    if 0 < pe <= 6: rv_score += 10.0
-    elif 6 < pe <= 12: rv_score += 7.0
-    elif 12 < pe <= 20: rv_score += 4.0
-    else: rv_score += 1.0
-
-    # Dividend Yield Evaluation
-    if dy >= 10.0: rv_score += 8.0
-    elif dy >= 5.0: rv_score += 5.0
-    elif dy > 0: rv_score += 3.0
-    else: rv_score += 1.0
-
-    # Debt Health
-    if debt is not None and cash is not None:
-        if debt == 0 or cash > debt: rv_score += 7.0
-        else: rv_score += 3.0
-    else:
-        rv_score += 5.0  # Neutral balance
-
-    rv_score += min(max(gov, 0.0), 10.0)
-
-    # Final Aggregation
     total_score = round(bq_score + mp_score + rv_score, 2)
     
     if total_score >= 85: status = "Multibagger Candidate"
@@ -313,7 +252,7 @@ def evaluate_multibagger(row: pd.Series) -> dict:
 # -----------------------------------------------------------------------------
 
 def generate_groq_research_note(api_key: str, company_data: dict, scores: dict) -> str:
-    """Generates an equity research note using Groq API."""
+    """Generates equity research note using Groq API."""
     try:
         client = Groq(api_key=api_key)
         prompt = f"""
@@ -356,10 +295,9 @@ def main():
     st.title("🇵🇰 PSX Multibagger Engine")
     st.markdown("Screen Pakistan Stock Exchange companies using a 100-point multibagger framework and Groq AI research.")
 
-    # Sidebar: Setup & API Config
     st.sidebar.header("⚙️ Configuration")
-    api_key_env = os.environ.get("GROQ_API_KEY", "")
-    groq_key = st.sidebar.text_input("Groq API Key", value=api_key_env, type="password", help="Enter key or set GROQ_API_KEY env variable")
+    api_key_env = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
+    groq_key = st.sidebar.text_input("Groq API Key", value=api_key_env, type="password", help="Enter key or set GROQ_API_KEY in Secrets")
     
     st.sidebar.markdown("---")
     data_source = st.sidebar.radio("Data Source Option", ["Upload File / Paste CSV", "Direct Fetch from PSX Portal"])
@@ -392,7 +330,7 @@ def main():
 
     else:
         st.subheader("🌐 Direct PSX Web Data Fetch")
-        symbol_input = st.text_input("Enter PSX Symbol (e.g., OGDC, SYS, LUCK, ENGRO):", value="OGDC")
+        symbol_input = st.text_input("Enter PSX Symbol (e.g., OGDC, SYS, LUCK, HUBC):", value="HUBC")
         if st.button("Fetch Live Data from PSX Portal"):
             with st.spinner("Scraping PSX Web Portal..."):
                 psx_data = fetch_psx_web_data(symbol_input)
@@ -402,18 +340,15 @@ def main():
                     st.success("Successfully fetched data!")
                     df_raw = pd.DataFrame([psx_data])
 
-    # Processing and Display Logic
     if df_raw is not None and not df_raw.empty:
         df_clean = standardize_columns(df_raw)
         
-        # Verify Minimum Required Columns
         req_cols = ["ticker", "price", "market_cap", "eps"]
         missing = [col for col in req_cols if col not in df_clean.columns]
 
         if missing:
             st.warning(f"Missing required columns: {missing}. Standardized columns available: {list(df_clean.columns)}")
         else:
-            # Process Scores
             evaluated_list = []
             for _, row in df_clean.iterrows():
                 scores = evaluate_multibagger(row)
@@ -425,7 +360,6 @@ def main():
             st.markdown("---")
             st.subheader("📊 Multibagger Screening Results")
 
-            # Score Summary Cards
             col1, col2, col3, col4 = st.columns(4)
             total_count = len(results_df)
             candidates = len(results_df[results_df["status"] == "Multibagger Candidate"])
@@ -436,7 +370,6 @@ def main():
             col3.metric("Watchlist", watchlist)
             col4.metric("Avg Score", f"{results_df['total_score'].mean():.1f}/100")
 
-            # Display Primary Table
             display_cols = ["ticker", "price", "market_cap", "eps", "total_score", "status", "buy_setup_score", "bq_score", "mp_score", "rv_score"]
             avail_display_cols = [c for c in display_cols if c in results_df.columns]
             
@@ -445,7 +378,6 @@ def main():
                 use_container_width=True
             )
 
-            # --- AI Research Note Generation Section ---
             st.markdown("---")
             st.subheader("🤖 Groq AI Equity Research Note")
 
@@ -453,7 +385,7 @@ def main():
             
             if st.button("Generate Research Note"):
                 if not groq_key:
-                    st.error("Please provide a Groq API Key in the sidebar or via GROQ_API_KEY environment variable.")
+                    st.error("Please provide a Groq API Key in the sidebar or via Streamlit Secrets.")
                 else:
                     selected_data = results_df[results_df["ticker"] == selected_ticker].iloc[0].to_dict()
                     scores_data = {
@@ -470,90 +402,7 @@ def main():
                         st.markdown(note)
 
     else:
-        st.info("Please upload a dataset, paste CSV data, or fetch a symbol directly from the sidebar to begin screening.")
+        st.info("Please upload a dataset, paste CSV data, or fetch a symbol directly to begin screening.")
 
 if __name__ == "__main__":
     main()
-
-
-@st.cache_data(ttl=900)  # Cache results for 15 minutes
-def fetch_psx_web_data(symbol: str) -> dict:
-    """
-    Directly scrapes live stock quote and statistical data from PSX Data Portal.
-    Uses flexible regex matching across all HTML tables to catch varied layouts.
-    """
-    symbol = symbol.strip().upper()
-    url = f"https://dps.psx.com.pk/company/{symbol}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return {"error": f"Symbol '{symbol}' not found or PSX Portal unavailable."}
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        # 1. Parse Current Price
-        price = None
-        price_elem = soup.find("div", class_="quote__close") or soup.find("div", class_="price")
-        if price_elem:
-            price_match = re.search(r"[\d,]+\.?\d*", price_elem.text)
-            if price_match:
-                price = float(price_match.group(0).replace(",", ""))
-
-        # 2. Extract Data from Stats Tables or Key Data Sections
-        scraped_data = {}
-        
-        # Look through all table rows and stat divs
-        elements = soup.find_all(["tr", "div"], class_=re.compile(r"stats|item|row|detail", re.I))
-        for elem in elements:
-            text = elem.get_text(separator=" ", strip=True).lower()
-            
-            # Extract Market Cap
-            if "market cap" in text and "market_cap" not in scraped_data:
-                match = re.search(r"(\d[\d,]*\b)", text)
-                if match:
-                    scraped_data["market_cap"] = float(match.group(1).replace(",", ""))
-
-            # Extract EPS
-            if ("eps" in text or "earnings per share" in text) and "eps" not in scraped_data:
-                match = re.search(r"(-?\d+\.?\d*)", text.split("eps")[-1])
-                if match:
-                    scraped_data["eps"] = float(match.group(1))
-
-            # Extract P/E
-            if ("p/e" in text or "pe ratio" in text) and "pe" not in scraped_data:
-                match = re.search(r"(\d+\.?\d*)", text.split("e")[-1])
-                if match:
-                    scraped_data["pe"] = float(match.group(1))
-
-            # Extract Dividend Yield
-            if ("div yield" in text or "dividend yield" in text) and "dividend_yield" not in scraped_data:
-                match = re.search(r"(\d+\.?\d*)", text)
-                if match:
-                    scraped_data["dividend_yield"] = float(match.group(1))
-
-        # Fallback values if specific items were missing from table loops
-        mcap = scraped_data.get("market_cap")
-        eps = scraped_data.get("eps")
-        pe = scraped_data.get("pe")
-        dy = scraped_data.get("dividend_yield", 0.0)
-
-        # Impute P/E if EPS and Price exist but P/E wasn't explicitly read
-        if pe is None and price and eps and eps > 0:
-            pe = round(price / eps, 2)
-
-        return {
-            "ticker": symbol,
-            "price": price,
-            "market_cap": mcap,
-            "eps": eps,
-            "pe": pe,
-            "dividend_yield": dy,
-            "source": "PSX Data Portal"
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to scrape PSX portal: {str(e)}"}
