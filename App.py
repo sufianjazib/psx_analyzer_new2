@@ -146,6 +146,8 @@ def extract_financials_via_groq(api_key: str, raw_html_text: str) -> dict:
     selected_row["governance_score"] = gov_input
     selected_row["catalyst_score"] = cat_input
     updated_scores = evaluate_multibagger(selected_row)
+    selected_row["catalyst_score"] = cat_input
+    updated_scores = evaluate_multibagger(selected_row)
 # -----------------------------------------------------------------------------
 # 3. MULTIBAGGER EVALUATION ENGINE (100-POINT FRAMEWORK)
 # -----------------------------------------------------------------------------
