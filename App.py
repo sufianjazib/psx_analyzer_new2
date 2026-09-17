@@ -212,7 +212,7 @@ def evaluate_multibagger(row: pd.Series) -> dict:
         rv_score += min(max(gov, 0.0), 12.0)
 
     else:
-        # Dynamic Scaling for Scraped Web Summaries
+        # Accelerated Valuation Scaling for Scraped Web Summaries
         if 0 < pe <= 5: bq_score = 36.0
         elif 5 < pe <= 8: bq_score = 30.0
         elif 8 < pe <= 12: bq_score = 24.0
@@ -337,7 +337,7 @@ def main():
                 if "error" in psx_data:
                     st.error(psx_data["error"])
                 else:
-                    st.success("Successfully fetched data!")
+                    st.success("Successfully fetched live quote statistics!")
                     df_raw = pd.DataFrame([psx_data])
 
     if df_raw is not None and not df_raw.empty:
@@ -347,8 +347,33 @@ def main():
         missing = [col for col in req_cols if col not in df_clean.columns]
 
         if missing:
-            st.warning(f"Missing required columns: {missing}. Standardized columns available: {list(df_clean.columns)}")
+            st.warning(f"Missing required basic columns: {missing}. Available: {list(df_clean.columns)}")
         else:
+            # Check for missing deep financial metrics
+            sample_row = df_clean.iloc[0]
+            deep_metrics = ["revenue", "roe", "operating_cash_flow", "debt"]
+            has_missing_deep = any(pd.isna(sample_row.get(m)) or sample_row.get(m) is None for m in deep_metrics)
+
+            if has_missing_deep:
+                st.info("💡 **PSX Portal Warning:** Extended financial statement data (Revenue, ROE, Cash Flow, Debt) is missing from the scraped portal summary. You can manually enter missing values below to get a fully tailored score.")
+                
+                with st.expander("✏️ Manually Fill Missing Financial Data (Optional)", expanded=False):
+                    c1, c2, c3 = st.columns(3)
+                    rev_input = c1.number_input("Revenue (PKR)", value=0.0)
+                    rev_prev_input = c1.number_input("Previous Year Revenue (PKR)", value=0.0)
+                    roe_input = c2.number_input("ROE (%)", value=0.0)
+                    roic_input = c2.number_input("ROIC (%)", value=0.0)
+                    ocf_input = c3.number_input("Operating Cash Flow (PKR)", value=0.0)
+                    debt_input = c3.number_input("Total Debt (PKR)", value=0.0)
+
+                    # Update dataframe row if values are provided manually
+                    if rev_input > 0: df_clean["revenue"] = rev_input
+                    if rev_prev_input > 0: df_clean["revenue_prev"] = rev_prev_input
+                    if roe_input > 0: df_clean["roe"] = roe_input
+                    if roic_input > 0: df_clean["roic"] = roic_input
+                    if ocf_input > 0: df_clean["operating_cash_flow"] = ocf_input
+                    if debt_input > 0: df_clean["debt"] = debt_input
+
             evaluated_list = []
             for _, row in df_clean.iterrows():
                 scores = evaluate_multibagger(row)
